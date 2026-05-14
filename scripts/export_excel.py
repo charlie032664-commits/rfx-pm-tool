@@ -39,6 +39,234 @@ HEADERS = [
 HIDDEN_COLS: set = set()
 
 
+# ── Big category buckets ─────────────────────────────────────────────────────
+# Maps small category (case-insensitive) → big-category sheet name.
+# Multi-value categories (e.g. "Compliance, Security") use only the FIRST value
+# to avoid double counting. Blank or unmapped categories fall through to "Others".
+
+BIG_CATEGORY_MAP: Dict[str, str] = {
+    # ── Hardware ────────────────────────────────────────────────────────────
+    "hardware":      "Hardware",
+    "platform":      "Hardware",
+    "cpu":           "Hardware",
+    "memory":        "Hardware",
+    "pcie":          "Hardware",
+    "storage":       "Hardware",
+    "storage/hw":    "Hardware",
+    "network":       "Hardware",
+    "wireless":      "Hardware",
+    "lan":           "Hardware",
+    "display":       "Hardware",
+    "interface":     "Hardware",
+    "i/o":           "Hardware",
+    "io":            "Hardware",
+    "power":         "Hardware",
+    "tpm":           "Hardware",
+    "performance":   "Hardware",
+    # ── Software ────────────────────────────────────────────────────────────
+    "software":      "Software",
+    "bios":          "Software",
+    "bmc":           "Software",
+    "firmware":      "Software",
+    "driver":        "Software",
+    "os":            "Software",
+    "management":    "Software",
+    "storage/sw":    "Software",
+    # ── Mechanical ──────────────────────────────────────────────────────────
+    "mechanical":     "Mechanical",
+    "serviceability": "Mechanical",
+    "chassis":        "Mechanical",
+    "bezel":          "Mechanical",
+    "dimension":      "Mechanical",
+    "label":          "Mechanical",
+    "packaging":      "Mechanical",
+    # ── Regulatory ──────────────────────────────────────────────────────────
+    "regulatory":    "Regulatory",
+    "emc":           "Regulatory",
+    "safety":        "Regulatory",
+    "ce":            "Regulatory",
+    "fcc":           "Regulatory",
+    "rohs":          "Regulatory",
+    "certification": "Regulatory",
+    "compliance":    "Regulatory",
+    "security":      "Regulatory",
+    "legal":         "Regulatory",
+    # ── Environmental ───────────────────────────────────────────────────────
+    "environmental": "Environmental",
+    "temperature":   "Environmental",
+    "thermal":       "Environmental",
+    "humidity":      "Environmental",
+    "shock":         "Environmental",
+    "vibration":     "Environmental",
+    "reliability":   "Environmental",
+    # ── Others (explicit; blank/unmapped also default to Others) ────────────
+    "general":       "Others",
+    "commercial":    "Others",
+    "documentation": "Others",
+    "unknown":       "Others",
+}
+
+BIG_CATEGORY_ORDER = [
+    "Hardware", "Software", "Mechanical", "Regulatory", "Environmental", "Others",
+]
+
+
+def _first_category(category) -> str:
+    """Return the first category from a list or comma-joined string."""
+    if isinstance(category, list):
+        return str(category[0]).strip() if category else ""
+    s = str(category or "").strip()
+    if "," in s:
+        return s.split(",", 1)[0].strip()
+    return s
+
+
+def _to_big_category(category) -> str:
+    """Map first-of small category to its big-category bucket. Unknown/blank → Others."""
+    first = _first_category(category)
+    return BIG_CATEGORY_MAP.get(first.lower(), "Others")
+
+
+def _has_redflag(r: Dict[str, Any]) -> bool:
+    msgs = r.get("risk_tags") or r.get("redflag_tags") or r.get("redflag_messages") or []
+    return bool(msgs and str(msgs) not in ("[]", ""))
+
+
+def bucket_by_big_category(reqs: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+    """Group requirements into the 6 big-category buckets.
+
+    All buckets are initialized (may be empty) so that empty-sheet creation
+    downstream is deterministic. Preserves caller-provided ordering within
+    each bucket (so a pre-sorted main_reqs stays sorted inside each sheet).
+    """
+    buckets: Dict[str, List[Dict[str, Any]]] = {bc: [] for bc in BIG_CATEGORY_ORDER}
+    for r in reqs:
+        big = _to_big_category(r.get("category", ""))
+        buckets[big].append(r)
+    return buckets
+
+
+def write_summary_sheet(ws, buckets: Dict[str, List[Dict[str, Any]]]) -> None:
+    """Write a pivot of counts per (Group, small Category).
+
+    Columns: Group | Category | Total | MUST | SHOULD | MAY | INFO
+             | NEED_REVIEW | COMPLIANT | PARTIAL | NON_COMPLIANT | Owner(s)
+
+    Rows are one per (Group, small Category) actually present in the data.
+    Multi-value categories use the FIRST value (same rule as bucket_by_big_category).
+    A final "Total" grand-row sums all numeric columns.
+    """
+    headers = [
+        "Group", "Category", "Total",
+        "MUST", "SHOULD", "MAY", "INFO",
+        "NEED_REVIEW", "COMPLIANT", "PARTIAL", "NON_COMPLIANT",
+        "Owner(s)",
+    ]
+    ws.append(headers)
+
+    grand = {"total": 0, "must": 0, "should": 0, "may": 0, "info": 0,
+             "nr": 0, "comp": 0, "part": 0, "non": 0}
+
+    for big_cat in BIG_CATEGORY_ORDER:
+        items = buckets.get(big_cat, [])
+        if not items:
+            continue
+        # Sub-group by small category (first-of), stable alphabetical order
+        by_small: Dict[str, List[Dict[str, Any]]] = {}
+        for r in items:
+            small = _first_category(r.get("category", "")) or "(blank)"
+            by_small.setdefault(small, []).append(r)
+        for small in sorted(by_small.keys(), key=str.lower):
+            sub = by_small[small]
+            total  = len(sub)
+            must   = sum(1 for r in sub if str(r.get("must_level", "")).upper() == "MUST")
+            should = sum(1 for r in sub if str(r.get("must_level", "")).upper() == "SHOULD")
+            may    = sum(1 for r in sub if str(r.get("must_level", "")).upper() == "MAY")
+            info   = sum(1 for r in sub if str(r.get("must_level", "")).upper() == "INFO")
+            # NOTE: status COMPLIANT/PARTIAL/NON-COMPLIANT come from responses.json,
+            # already merged into r["status"] above. The status string uses a HYPHEN
+            # ("NON-COMPLIANT"); the column header keeps underscore as requested.
+            status_u = lambda r: str(r.get("status", "")).upper()
+            nr     = sum(1 for r in sub if status_u(r) == "NEED_REVIEW")
+            comp   = sum(1 for r in sub if status_u(r) == "COMPLIANT")
+            part   = sum(1 for r in sub if status_u(r) == "PARTIAL")
+            non    = sum(1 for r in sub if status_u(r) == "NON-COMPLIANT")
+            owners = sorted({
+                str(r.get("owner", "")).strip()
+                for r in sub
+                if str(r.get("owner", "")).strip()
+            }, key=str.lower)
+            ws.append([big_cat, small, total, must, should, may, info,
+                       nr, comp, part, non, ", ".join(owners)])
+            grand["total"]  += total
+            grand["must"]   += must
+            grand["should"] += should
+            grand["may"]    += may
+            grand["info"]   += info
+            grand["nr"]     += nr
+            grand["comp"]   += comp
+            grand["part"]   += part
+            grand["non"]    += non
+
+    # Grand-total row (Owner(s) column intentionally blank)
+    ws.append([
+        "Total", "",
+        grand["total"], grand["must"], grand["should"], grand["may"], grand["info"],
+        grand["nr"], grand["comp"], grand["part"], grand["non"],
+        "",
+    ])
+
+    # ── Styling ────────────────────────────────────────────────────────────
+    header_font  = Font(bold=True, color="FFFFFF", name="Arial")
+    header_fill  = PatternFill("solid", fgColor="1F4E79")
+    header_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    thin = Side(style="thin", color="D9D9D9")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    for c in range(1, ws.max_column + 1):
+        cell = ws.cell(row=1, column=c)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = header_align
+        cell.border = border
+
+    numeric_cols = {3, 4, 5, 6, 7, 8, 9, 10, 11}
+    for row in range(2, ws.max_row + 1):
+        for col in range(1, ws.max_column + 1):
+            cell = ws.cell(row=row, column=col)
+            cell.border = border
+            if col in numeric_cols:
+                cell.alignment = Alignment(vertical="center", horizontal="right")
+            else:
+                cell.alignment = Alignment(vertical="center", horizontal="left", wrap_text=True)
+
+    # Bold + tinted grand-total row (last row)
+    for col in range(1, ws.max_column + 1):
+        cell = ws.cell(row=ws.max_row, column=col)
+        cell.font = Font(bold=True, name="Arial")
+        cell.fill = PatternFill("solid", fgColor="E3F2FD")
+
+    widths = {
+        1: 14,   # Group
+        2: 18,   # Category
+        3: 8,    # Total
+        4: 8,    # MUST
+        5: 9,    # SHOULD
+        6: 7,    # MAY
+        7: 7,    # INFO
+        8: 14,   # NEED_REVIEW
+        9: 12,   # COMPLIANT
+        10: 10,  # PARTIAL
+        11: 16,  # NON_COMPLIANT
+        12: 32,  # Owner(s)
+    }
+    for col_idx, w in widths.items():
+        ws.column_dimensions[get_column_letter(col_idx)].width = w
+
+    ws.auto_filter.ref = f"A1:{get_column_letter(ws.max_column)}{ws.max_row}"
+    ws.freeze_panes = "C2"
+
+
 def read_json(p: Path) -> Dict[str, Any]:
     return json.loads(p.read_text(encoding="utf-8"))
 
@@ -331,9 +559,22 @@ def export_excel(data: Dict[str, Any], out_xlsx: Path, responses_path: Optional[
         )
     main_reqs = sorted(main_reqs, key=_sort_key)
 
+    # Sheet order: Compliance Matrix (總表, sheet 1) → By_Category_Summary (sheet 2)
+    # → 6 big-category sheets numbered 3..8 → Glossary → Notes.
+    # The display name is numbered ("3. Hardware") for customer-facing readability,
+    # but the internal Group label inside By_Category_Summary stays "Hardware".
     write_sheet(wb.create_sheet("Compliance Matrix"), main_reqs)
-    write_sheet(wb.create_sheet("Glossary"),          glossary_reqs)
-    write_sheet(wb.create_sheet("Notes"),             notes_reqs)
+
+    # Bucket the already-sorted main_reqs so each big-category sheet preserves
+    # the same sort order (NEED_REVIEW > redflag > MUST > category).
+    buckets = bucket_by_big_category(main_reqs)
+    write_summary_sheet(wb.create_sheet("By_Category_Summary"), buckets)
+    for idx, big_cat in enumerate(BIG_CATEGORY_ORDER, start=3):
+        sheet_name = f"{idx}. {big_cat}"
+        write_sheet(wb.create_sheet(sheet_name), buckets[big_cat])
+
+    write_sheet(wb.create_sheet("Glossary"), glossary_reqs)
+    write_sheet(wb.create_sheet("Notes"),    notes_reqs)
 
     out_xlsx.parent.mkdir(parents=True, exist_ok=True)
     wb.save(out_xlsx)
@@ -387,7 +628,9 @@ def main():
 
     print(f"[OK] Input : {in_path}")
     print(f"[OK] Output: {out_path}")
-    print("[OK] Sheets: Compliance Matrix, Glossary, Notes")
+    print("[OK] Sheets: Compliance Matrix, By_Category_Summary, "
+          "3. Hardware, 4. Software, 5. Mechanical, "
+          "6. Regulatory, 7. Environmental, 8. Others, Glossary, Notes")
 
 
 if __name__ == "__main__":
