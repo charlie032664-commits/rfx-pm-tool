@@ -202,6 +202,145 @@ _BARE_NUMBER = re.compile(
     r"^[\d]+(\.\d+)?\s*(%|GB|MB|TB|GHz|MHz|V|W|A|mm|kg|lbs?|pcs?|ea)?$", re.IGNORECASE
 )
 
+# ── Phase 4: obvious-noise patterns ──────────────────────────────────────────
+# Each pattern is anchored ^...$ so it only triggers when the WHOLE text is
+# the noise — a real requirement that happens to contain a date/name as a
+# substring will NOT be caught.
+
+_PURE_DATE = re.compile(
+    r"^\s*(?:"
+    r"\d{1,2}[/\-.]\d{1,2}[/\-.]\d{2,4}"            # 5/5/26, 5-5-2026, 5.5.26
+    r"|\d{4}[/\-.]\d{1,2}[/\-.]\d{1,2}"             # 2026/05/05
+    r"|\d{1,2}[\s\-/](?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*[\s\-/]\d{2,4}"
+    r"|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2},?\s+\d{2,4}"
+    r")\s*$", re.IGNORECASE
+)
+
+_EMAIL_ONLY = re.compile(
+    r"^\s*[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\s*$"
+)
+
+# "Carty, Clark <ck@x.com>" — name + email-in-angle-brackets
+_CONTACT_WITH_EMAIL = re.compile(
+    r"^\s*[A-Z][A-Za-z\s,.\-']*?<\s*[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\s*>\s*$"
+)
+
+_TICK_OR_LABEL = re.compile(
+    r"^\s*(?:[✓✔✕✖✗✘×]+"
+    r"|Y|N|YES|NO|N/A|NA|TBD|TBC|TBA|N\.A\.|NIL|Y/N|N/Y)\s*$",
+    re.IGNORECASE
+)
+
+# Single capitalized name, 1-2 title-case words, letters/hyphen only
+# Will catch "Bernd", "Jing Hui". Won't catch ALL-CAPS like "CPU" or numeric "8GB".
+_SINGLE_NAME = re.compile(
+    r"^\s*[A-Z][a-z]+(?:[\s\-][A-Z][a-z]+)?\s*$"
+)
+
+# 1-4 letter ALL-CAPS abbrev alone (HW, BMC, IT, BIOS)
+_UPPER_ABBREV = re.compile(r"^\s*[A-Z]{1,4}\s*$")
+
+# Revision/update log phrase (only triggers when text is short overall, see is_obvious_noise)
+_REVLOG_PATTERN = re.compile(
+    r"^\s*(?:"
+    r"(?:schedule|forecast|specification|spec|status|design|review|version|requirement)"
+    r"(?:\s*&\s*\w+)?\s+"
+    r"(?:updated|modified|approved|reviewed|locked|finalized|completed|added|removed|frozen)"
+    r"|(?:updated|modified|reviewed|approved|created)\s+by\s+"
+    r"|rev(?:ision)?\s*[:#]?\s*\d"
+    r"|owner\s*[:#]\s*[A-Z]"
+    r")", re.IGNORECASE
+)
+
+# Country + cert label, no verb (e.g. "Argentina S-Mark")
+_COUNTRY_CERT = re.compile(
+    r"^\s*(?:Argentina|Brazil|Mexico|China|India|Korea|Japan|Taiwan|USA|EU|UK|"
+    r"Germany|France|Australia|Canada|Russia|Israel|Singapore|Indonesia|Vietnam|Thailand)\s+"
+    r"(?:S-Mark|INMETRO|CCC|BIS|KC|VCCI|BSMI|FCC|CE|UL|RoHS|REACH|RCM|MIC|NCC)\s*$",
+    re.IGNORECASE
+)
+
+# Sub-item bullet marker at start (a/b/c, 1./2., i./ii., -, •)
+# The outer `\s+` handles the gap between marker and content, so the bullet
+# alternative itself must NOT also consume whitespace.
+_ORPHAN_MARKER = re.compile(
+    r"^\s*(?:"
+    r"\(?[a-z]\)"               # a), (a), (A)
+    r"|\d+[\.\)]"               # 1., 1)
+    r"|[ivxIVX]{1,4}\."         # ii., I.
+    r"|[\-•*◦●·]"               # -, •, ◦, ●, ·
+    r"|[a-z]\."                 # a., A.
+    r")\s+", re.IGNORECASE
+)
+
+
+def is_obvious_noise(text: str, notes: str = "") -> bool:
+    """Return True for text that is clearly NOT a requirement.
+
+    Conservative — every pattern is anchored to the WHOLE text, so a real
+    requirement that contains a date/name as a substring is preserved.
+
+    Items already classified as glossary/note via `notes` are exempted so
+    classify_item can route them to the right sheet.
+    """
+    n_upper = (notes or "").upper()
+    if "GLOSSARY" in n_upper or "DEFINITION" in n_upper or "RFP_PROCESS" in n_upper:
+        return False
+
+    t = (text or "").strip()
+    if not t:
+        return True
+
+    # 1. Pure date
+    if _PURE_DATE.match(t):
+        return True
+    # 2. Email-only or contact-with-email
+    if _EMAIL_ONLY.match(t) or _CONTACT_WITH_EMAIL.match(t):
+        return True
+    # 3. Tick / short label value (✓, Y/N, TBD, …)
+    if _TICK_OR_LABEL.match(t):
+        return True
+    # 4. ALL-CAPS abbrev alone (HW, BMC, …)
+    if _UPPER_ABBREV.match(t):
+        return True
+    # 5. Country + cert label only
+    if _COUNTRY_CERT.match(t):
+        return True
+    # 6. Revision / update log (only if text is short)
+    if len(re.findall(r"\w+", t)) <= 7 and _REVLOG_PATTERN.match(t):
+        return True
+    # 7. Single capitalized name (1-2 title-case words, no requirement verb)
+    if _SINGLE_NAME.match(t) and not _REQUIREMENT_VERBS.search(t):
+        return True
+
+    return False
+
+
+def is_likely_orphan_subitem(text: str, item_type: str, is_derived: bool) -> bool:
+    """Narrow detection: text starts with a/b/c/1./2./bullet marker AND
+    is short AND has no requirement verb.
+
+    Per Phase 4 spec: ONLY a/b/c-style sub-items missing parent context.
+    Not used for general junk — those are handled by is_obvious_noise.
+    """
+    if is_derived:
+        return False
+    if item_type != "requirement":
+        return False
+    t = (text or "").strip()
+    if not t:
+        return False
+    if not _ORPHAN_MARKER.match(t):
+        return False
+    word_count = len(re.findall(r"\w+", t))
+    # Numbered real requirement ("1. Memory shall be 8GB") has a verb → not orphan
+    if _REQUIREMENT_VERBS.search(t):
+        return False
+    # Full sentences (>8 words) without verb are also unlikely to be orphans
+    if word_count > 8:
+        return False
+    return True
+
 
 def is_junk_short(text: str) -> bool:
     """True if text is too short to be a real requirement and has no requirement verbs."""
@@ -247,15 +386,29 @@ def dedup_requirements(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 def filter_junk(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Remove items that are junk short values or standalone part numbers/spec values."""
+    """Remove items that are clearly not requirements:
+    - obvious noise (dates / contacts / names / symbols / revision-log / cert label / abbrev)
+    - junk-short text (< 3 words with no requirement verb)
+    - standalone part numbers / spec values
+
+    AUTO_SKIP-classified items (glossary by enricher) are exempted from the
+    new obvious-noise filter so the glossary sheet stays intact.
+    """
     out: List[Dict[str, Any]] = []
     removed_short = 0
     removed_pn = 0
+    removed_noise = 0
     for r in items:
         if r.get("derived_requirement"):
             out.append(r)
             continue
         text = (r.get("requirement") or "").strip()
+        notes = (r.get("notes") or "").strip()
+        status_u = str(r.get("status") or "").upper()
+
+        if status_u != "AUTO_SKIP" and is_obvious_noise(text, notes):
+            removed_noise += 1
+            continue
         if is_junk_short(text):
             removed_short += 1
             continue
@@ -263,8 +416,12 @@ def filter_junk(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             removed_pn += 1
             continue
         out.append(r)
-    if removed_short or removed_pn:
-        print(f"[POSTPROCESS] Filter: removed {removed_short} too-short, {removed_pn} part-number/spec ({len(out)} remaining)")
+    if removed_short or removed_pn or removed_noise:
+        print(
+            f"[POSTPROCESS] Filter: removed {removed_noise} obvious-noise, "
+            f"{removed_short} too-short, {removed_pn} part-number/spec "
+            f"({len(out)} remaining)"
+        )
     return out
 
 
@@ -291,6 +448,8 @@ _RISK_TAG_MAP = {
     "SECURITY_TPM_COMPLIANCE": "CERT",
     "SUBJECTIVE_ACCEPTANCE":   "ACCEPTANCE",
     "FIELD_SERVICE_IMPACT":    "SERVICEABILITY",
+    # Phase 4 orphan-subitem tag (passes through unchanged)
+    "ORPHAN_SUBITEM":          "ORPHAN_SUBITEM",
 }
 
 # Map long Chinese redflag messages (from redflags.yaml) to short tags
@@ -315,6 +474,7 @@ _RISK_NOTE_MAP = {
     "GLOSSARY":       "Definition/abbreviation — informational only",
     "ACCEPTANCE":     "Subjective acceptance criteria — clarify with customer",
     "SERVICEABILITY": "Field service impact — confirm replacement policy",
+    "ORPHAN_SUBITEM": "Possible orphan sub-item; verify parent context in original document",
 }
 
 # Category correction: keyword → canonical category
@@ -586,7 +746,11 @@ def build_rows(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         has_rf = bool(redflag_val and str(redflag_val) not in ("[]", ""))
 
         if item_type in ("note", "junk"):
-            if must_level_val in ("MUST", "SHOULD", "MAY"):
+            # Phase 4 guard: obvious-noise text is never promoted to requirement,
+            # even if upstream LLM enrichment marked it MUST/SHOULD/MAY.
+            if is_obvious_noise(text, notes):
+                item_type = "junk"
+            elif must_level_val in ("MUST", "SHOULD", "MAY"):
                 item_type = "requirement"
             elif status_val == "NEED_REVIEW":
                 item_type = "requirement"
@@ -624,6 +788,14 @@ def build_rows(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             category, owner, redflags, evidence, next_action = auto_owner_category_redflags_heuristic(text, item_type)
             status = auto_status(item_type, mlevel, redflags)
             raw_rf = redflags
+
+        # Phase 4: narrow orphan-subitem detection (a/b/c bullet without parent context)
+        if is_likely_orphan_subitem(text, item_type, is_derived):
+            if "ORPHAN_SUBITEM" not in raw_rf:
+                raw_rf.append("ORPHAN_SUBITEM")
+            status = "NEED_REVIEW"
+            if not next_action:
+                next_action = "Verify parent context — read source document"
 
         # ── Normalize ──
         category = normalize_category(category, text)

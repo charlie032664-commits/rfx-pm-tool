@@ -1263,6 +1263,11 @@ else:
             if _risk_note:
                 st.caption(f"Risk: {_risk_note}")
 
+            # Phase 4: show source so PM can trace ORPHAN_SUBITEM / NEED_REVIEW back to original
+            _src = item.get("source", "")
+            if _src:
+                st.caption(f"📍 Source: {_src}")
+
             ai_draft = cur.get("ai_draft", "")
             if ai_draft:
                 st.caption(f"AI Draft: {ai_draft}")
