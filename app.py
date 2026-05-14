@@ -5,6 +5,7 @@ import re
 import socket
 import subprocess
 import sys
+import pandas as pd
 import streamlit as st
 import yaml
 from datetime import datetime, timedelta
@@ -211,6 +212,67 @@ def run_step(cmd: list) -> tuple[int, str]:
     )
     output = (result.stdout + result.stderr).strip()
     return result.returncode, output
+
+
+# ── File selection (Step 1.5: PM marks include/exclude before pipeline) ─────
+# First version is ADVISORY: writes inbound/<case_id>/meta/file_selection.json
+# but does NOT change which files the extractor actually processes.
+# Phase 7 will wire enforcement into extract_requirements_llm.py.
+
+def load_file_selection(case_id: str) -> dict:
+    """Read inbound/<case>/meta/file_selection.json. Returns {} if missing
+    or unreadable. Schema: {case_id, updated_at, updated_by, selections}."""
+    p = INBOUND_DIR / case_id / "meta" / "file_selection.json"
+    if not p.exists():
+        return {}
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_file_selection(case_id: str, selections: dict) -> None:
+    """Write file_selection.json with nested-dict schema:
+    selections = { filename: {"include": bool, "reason": str} }."""
+    p = INBOUND_DIR / case_id / "meta" / "file_selection.json"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "case_id":    case_id,
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+        "updated_by": getpass.getuser(),
+        "selections": selections,
+    }
+    p.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _get_file_role_confidence(doc_schema_info: dict | None, filename: str) -> tuple[str, str]:
+    """Look up a file's role + confidence from doc_schema.json.
+
+    Returns ("?", "—") when:
+      - doc_schema is missing / not yet generated, OR
+      - the file isn't found in either the new (per-file list) or old
+        (main_files/appendix_files) doc_schema formats.
+    """
+    if not doc_schema_info:
+        return ("?", "—")
+    # New format: files: [{file, role, confidence, ...}]
+    for f in (doc_schema_info.get("files") or []):
+        if f.get("file") == filename:
+            role = f.get("role", "?")
+            conf = f.get("confidence")
+            conf_str = f"{int(conf * 100)}%" if isinstance(conf, (int, float)) else "—"
+            return (role, conf_str)
+    # Old format: main_files / appendix_files lists with single overall confidence
+    overall = doc_schema_info.get("confidence")
+    conf_str = f"{int(overall * 100)}%" if isinstance(overall, (int, float)) else "—"
+    appendix = doc_schema_info.get("appendix_files") or []
+    main     = doc_schema_info.get("main_files") or []
+    if filename in appendix or any(filename.startswith(af[:20]) for af in appendix if af):
+        return ("appendix", conf_str)
+    if filename in main or any(filename.startswith(mf[:20]) for mf in main if mf):
+        return ("main_requirement", conf_str)
+    return ("?", "—")
 
 
 # ── Pipeline lock (case-level, advisory) ─────────────────────────────────────
@@ -483,6 +545,112 @@ if rfq_dir.exists():
             unsafe_allow_html=True,
         )
 
+# ── Step 1.5: Review & Select RFQ Files (advisory; gated by Select Existing Case) ──
+if mode == "Select Existing Case" and rfq_dir.exists():
+    _rfq_files = sorted([f for f in rfq_dir.iterdir() if f.is_file()])
+    if _rfq_files:
+        st.subheader("Step 1.5: Review & Select RFQ Files")
+
+        # Load doc_schema.json for role/confidence lookup; missing is OK
+        _schema_path = INBOUND_DIR / selected_case / "meta" / "doc_schema.json"
+        _doc_schema_for_table: dict | None = None
+        if _schema_path.exists():
+            try:
+                _doc_schema_for_table = json.loads(_schema_path.read_text(encoding="utf-8"))
+            except Exception:
+                _doc_schema_for_table = None
+
+        _SUPPORTED_EXT = {".docx", ".doc", ".xlsx", ".xls", ".pdf", ".txt", ".md"}
+        _loaded = load_file_selection(selected_case)
+        _loaded_sel = _loaded.get("selections") or {}
+
+        _rows = []
+        for _f in _rfq_files:
+            _ext = _f.suffix.lower()
+            try:
+                _size = _f.stat().st_size
+            except Exception:
+                _size = 0
+            if _size < 1024:
+                _size_str = f"{_size} B"
+            elif _size < 1024 * 1024:
+                _size_str = f"{_size / 1024:.1f} KB"
+            else:
+                _size_str = f"{_size / 1024 / 1024:.2f} MB"
+            _role, _conf_str = _get_file_role_confidence(_doc_schema_for_table, _f.name)
+            _prev = _loaded_sel.get(_f.name, {})
+            if not isinstance(_prev, dict):
+                _prev = {}
+            _rows.append({
+                "Include":    bool(_prev.get("include", True)),
+                "File":       _f.name,
+                "Type":       _ext if _ext else "—",
+                "Size":       _size_str,
+                "Supported":  "✓" if _ext in _SUPPORTED_EXT else "⚠️",
+                "Role":       _role,
+                "Confidence": _conf_str,
+                "Reason":     str(_prev.get("reason") or ""),
+            })
+
+        _total = len(_rows)
+        _incl  = sum(1 for r in _rows if r["Include"])
+        _excl  = _total - _incl
+        _unsup = sum(1 for r in _rows if r["Supported"] != "✓")
+        st.markdown(
+            f"<p style='font-size:0.95rem;color:#455A64;margin-bottom:8px;'>"
+            f"<b>{_total}</b> file(s) &nbsp;|&nbsp; included: <b>{_incl}</b> &nbsp;|&nbsp; "
+            f"excluded: <b>{_excl}</b> &nbsp;|&nbsp; unsupported: <b>{_unsup}</b></p>",
+            unsafe_allow_html=True,
+        )
+
+        _df = pd.DataFrame(_rows)
+        _edited = st.data_editor(
+            _df,
+            column_config={
+                "Include":    st.column_config.CheckboxColumn(
+                    "Include", default=True,
+                    help="Mark whether this file should feed the pipeline "
+                         "(advisory only in Phase 3 — does not yet skip files)",
+                ),
+                "File":       st.column_config.TextColumn("File",       disabled=True),
+                "Type":       st.column_config.TextColumn("Type",       disabled=True, width="small"),
+                "Size":       st.column_config.TextColumn("Size",       disabled=True, width="small"),
+                "Supported":  st.column_config.TextColumn("Supported",  disabled=True, width="small"),
+                "Role":       st.column_config.TextColumn("Role",       disabled=True),
+                "Confidence": st.column_config.TextColumn("Confidence", disabled=True, width="small"),
+                "Reason":     st.column_config.TextColumn(
+                    "Reason",
+                    help="Optional note explaining why this file is excluded",
+                ),
+            },
+            hide_index=True,
+            use_container_width=True,
+            key=f"file_selection_editor_{selected_case}",
+        )
+
+        # Compare edited widget state to the freshly-loaded df to detect unsaved edits
+        _changed = not _edited.equals(_df)
+        if _changed:
+            st.warning("⚠️  Unsaved changes — click **Save Selection** to persist.")
+
+        _save_label = "💾 Save Selection ∗" if _changed else "💾 Save Selection"
+        if st.button(_save_label, key=f"save_file_selection_{selected_case}"):
+            _new_sel: dict = {}
+            for _, _row in _edited.iterrows():
+                _new_sel[str(_row["File"])] = {
+                    "include": bool(_row["Include"]),
+                    "reason":  str(_row.get("Reason") or "").strip(),
+                }
+            save_file_selection(selected_case, _new_sel)
+            st.success(f"Saved to inbound/{selected_case}/meta/file_selection.json")
+            st.rerun()
+
+        if _doc_schema_for_table is None:
+            st.caption(
+                "ℹ️ `doc_schema.json` not generated yet — Role / Confidence will "
+                "appear after the first pipeline run."
+            )
+
 st.divider()
 
 # ── Run Pipeline ──────────────────────────────────────────────────────────────
@@ -685,6 +853,22 @@ if mode == "Select Existing Case":
                 st.info(f"\U0001f4dd PM \u5099\u8a3b\uff1a{notes}")
     else:
         st.info("\U0001f4a1 \u5c1a\u672a\u5206\u6790\u6587\u4ef6\u683c\u5f0f\uff0cRun Full Pipeline \u6642\u6703\u81ea\u52d5\u5206\u6790\u4e26\u5132\u5b58\u81f3 meta/doc_schema.json")
+
+    # ── Step 1.5 advisory: warn if PM marked files excluded (not yet enforced) ──
+    _selection_data = load_file_selection(selected_case)
+    _excluded_files = [
+        _name for _name, _info in (_selection_data.get("selections") or {}).items()
+        if isinstance(_info, dict) and not _info.get("include", True)
+    ]
+    if _excluded_files:
+        _shown = ", ".join(f"`{n}`" for n in _excluded_files[:3])
+        if len(_excluded_files) > 3:
+            _shown += f", … (+{len(_excluded_files) - 3} more)"
+        st.info(
+            f"ℹ️ **{len(_excluded_files)} file(s) marked excluded in Step 1.5**: {_shown}  \n"
+            "First version is **advisory only** — the pipeline will still process "
+            "all files in `rfq/`. (Phase 7 will enforce skipping.)"
+        )
 
     # ── Pipeline lock state (computed BEFORE buttons so we can gate them) ──
     _lock_info   = read_lock_info(selected_case)
