@@ -1,0 +1,113 @@
+version: 2
+rules:
+- id: RF_GLOSSARY
+  name: Glossary / Definition
+  match:
+    any_keywords:
+    - GLOSSARY/DEFINITION
+    - GLOSSARY
+    - DEFINITION
+  action:
+    force_status: AUTO_SKIP
+    force_category:
+    - Glossary
+    message: 名詞解釋/縮寫定義：不進入 compliance 回覆清單
+- id: RF_CERT
+  name: Certification / Regulatory
+  match:
+    any_keywords:
+    - FIPS
+    - IEC60950
+    - GB4943
+    - UL listed
+    - CE mark
+    - FCC
+    - RoHS
+    - REACH
+    - certification
+    - regulatory
+    - homologation
+  action:
+    force_status: NEED_REVIEW
+    require_evidence: true
+    message: 認證/法規：需提供認證報告或合規聲明，QA/Safety 審核
+- id: RF_RELIABILITY
+  name: Reliability / Environmental Test
+  match:
+    any_keywords:
+    - MTBF
+    - HALT
+    - ALT
+    - vibration
+    - shock
+    - acoustic
+    - humidity
+    - altitude
+    - thermal cycling
+    - package drop
+  action:
+    force_status: NEED_REVIEW
+    require_evidence: true
+    message: 可靠度/環境測試：需提供測試計畫或報告，QA/Safety 審核
+- id: RF_PRICE
+  name: Pricing / Payment
+  match:
+    any_keywords:
+    - price
+    - pricing
+    - quote
+    - cost
+    - USD
+    - TWD
+    - payment
+    - discount
+    - Incoterms
+  action:
+    force_status: NEED_REVIEW
+    forbid_llm_numbers: true
+    message: 價格/付款條款：禁止自動填金額，需 PM/Sales 審核
+- id: RF_SCHEDULE
+  name: Lead time / Delivery / Penalty
+  match:
+    any_keywords:
+    - lead time
+    - delivery
+    - shipment
+    - deadline
+    - penalty
+    - liquidated damages
+    - SLA
+  action:
+    force_status: NEED_REVIEW
+    require_evidence: true
+    message: 交期/罰則：需 PM 審核，缺資料先標 TBD
+- id: RF_IP
+  name: IP / Rights / Licensing
+  match:
+    any_keywords:
+    - intellectual property
+    - IP rights
+    - license
+    - licensing
+    - redistribute
+    - source code
+    - escrow
+    - rights to distribute
+  action:
+    force_status: NEED_REVIEW
+    require_evidence: true
+    message: 授權/IP 條款：需 Legal/PM 審核
+- id: RF_ROADMAP
+  name: Lifecycle / Roadmap
+  match:
+    any_keywords:
+    - roadmap
+    - 7-year
+    - lifecycle
+    - availability
+    - EOL
+    - end of life
+  action:
+    force_status: NEED_REVIEW
+    require_evidence: true
+    message: 供貨年限/roadmap：需 PM/EE 與供應鏈證據

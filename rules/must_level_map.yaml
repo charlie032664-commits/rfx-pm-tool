@@ -1,0 +1,31 @@
+version: 1
+labels: ["MUST", "SHOULD", "MAY", "INFO"]
+
+patterns:
+  MUST:
+    any:
+      - "must"
+      - "shall"
+      - "required"
+      - "need to"
+      - "is required to"
+      - "has to"
+      - "shall not"          # 也算 MUST（否定）
+      - "must not"
+  SHOULD:
+    any:
+      - "should"
+      - "preferred"
+      - "recommend"
+      - "ideally"
+  MAY:
+    any:
+      - "may"
+      - "optional"
+      - "can"
+  INFO:
+    any:
+      - "note"
+      - "for reference"
+      - "tbd"
+      - "n/a"

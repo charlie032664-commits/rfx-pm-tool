@@ -1,0 +1,34 @@
+# --- Python ---
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.tmp.*
+
+# --- Runtime / RFQ business data (do NOT version-control) ---
+inbound/
+runs/
+responses/
+output/
+temp/
+logs/
+*.log
+
+# --- Archives ---
+*.7z
+*.zip
+
+# --- Office / document binaries (templates excluded via !path/to/template.xlsx if needed) ---
+*.xlsx
+*.xls
+*.csv
+*.pdf
+*.docx
+*.pptx
+
+# --- Editor / OS ---
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,156 @@
+version: 1
+id_prefix_map:
+  BIOS-:
+  - BIOS
+  BMC-:
+  - BMC
+  HOST-:
+  - Platform
+keyword_map:
+  BIOS:
+  - PXE
+  - BBS
+  - SMBIOS
+  - headless
+  - USB boot
+  - PECI
+  - DIMM
+  BMC:
+  - IPMI
+  - Redfish
+  - SEL
+  - SNMP
+  - SOL
+  - iKVM
+  - watchdog
+  - BMC must
+  - BMC shall
+  - BMC is
+  - BMC firmware
+  Security:
+  - TPM
+  - security hardening
+  - chassis intrusion
+  - FIPS
+  Compliance:
+  - IEC60950
+  - IEC62368
+  - GB4943
+  - regulatory
+  - certification
+  - compliance
+  - IBM Standards
+  - certified compliant
+  - safety report
+  - FCC
+  - EMC
+  - IEEE1613
+  - PTCRB
+  - UL
+  - CE mark
+  - RoHS
+  - REACH
+  - EN55032
+  - EN55035
+  - CISPR
+  - NEBS
+  - GR-63
+  - homologation
+  Reliability:
+  - ALT
+  - HALT
+  - MTBF
+  - vibration
+  - shock
+  - package drop
+  - humidity
+  - altitude
+  - acoustic
+  - burn-in
+  - seismic
+  - thermal cycling
+  Power:
+  - PSU
+  - -48V
+  - Vac
+  - power supply
+  - clearance spacing
+  Thermal:
+  - thermal
+  - fan
+  - air flow
+  - air intake
+  Mechanical:
+  - bezel
+  - tray
+  - rail
+  - rack ear
+  - tool less
+  - paint
+  - screen print
+  - internal FRU
+  - operator access
+  - FRU component
+  Storage:
+  - NVMe
+  - SAS
+  - SATA
+  - M.2
+  - MegaRAID
+  - CacheVault
+  - RAID
+  - super-cap
+  - supercap
+  - cache vault
+  PCIe:
+  - PCIe
+  - x8
+  - x16
+  - NIM
+  - SIM
+  - XMC
+  Documentation:
+  - documentation
+  - schematics
+  - design verification
+  - factory test plan
+  - renderings
+  - API documentation
+  Commercial:
+  - price
+  - pricing
+  - quote
+  - lead time
+  - delivery
+  - penalty
+  - warranty
+  - quotation
+  - EOL
+  - exclusivity
+  - launch schedule
+  - Incoterms
+  - payment
+  - discount
+  - indemnity
+  - liability
+  Legal:
+  - license
+  - rights to
+  - redistribute
+  - IP
+  - source code
+  - NDA
+  - confidential
+  Platform:
+  - total memory
+  - management port
+  - 1GbE
+  - 10GbE
+  - RJ45
+  - NIC
+glossary_notes_hit:
+- GLOSSARY/DEFINITION
+- GLOSSARY
+- DEFINITION
+default_category:
+- General
