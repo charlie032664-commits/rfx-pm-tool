@@ -226,7 +226,7 @@ _CONTACT_WITH_EMAIL = re.compile(
 )
 
 _TICK_OR_LABEL = re.compile(
-    r"^\s*(?:[✓✔✕✖✗✘×]+"
+    r"^\s*(?:[✓✔✕✖✗✘×√]+"   # added √ (U+221A SQUARE ROOT) — common Asian-doc tick
     r"|Y|N|YES|NO|N/A|NA|TBD|TBC|TBA|N\.A\.|NIL|Y/N|N/Y)\s*$",
     re.IGNORECASE
 )
