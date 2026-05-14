@@ -1,10 +1,13 @@
+import getpass
 import json
 import os
 import re
+import socket
 import subprocess
 import sys
 import streamlit as st
 import yaml
+from datetime import datetime, timedelta
 from pathlib import Path
 from scripts.responses_manager import ResponsesManager
 
@@ -208,6 +211,135 @@ def run_step(cmd: list) -> tuple[int, str]:
     )
     output = (result.stdout + result.stderr).strip()
     return result.returncode, output
+
+
+# ── Pipeline lock (case-level, advisory) ─────────────────────────────────────
+# Lock file lives at: runs/<case_id>/.pipeline.lock
+# Stale rule: file age > PIPELINE_LOCK_STALE_HOURS (2h).
+# PID-dead is supplementary info only; it does NOT override the 2h rule.
+
+PIPELINE_LOCK_STALE_HOURS = 2
+
+
+def _lock_path(case_id: str) -> Path:
+    return RUNS_DIR / case_id / ".pipeline.lock"
+
+
+def _pid_alive(pid: int) -> bool:
+    """Best-effort cross-platform PID liveness check.
+
+    Used only for *displaying* informational warnings in the UI — never
+    consulted when deciding whether a lock is stale (the 2-hour rule wins).
+    Windows PID reuse may produce false positives; acceptable for an
+    advisory single-machine lock.
+    """
+    try:
+        pid_int = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid_int <= 0:
+        return False
+    try:
+        if sys.platform == "win32":
+            import ctypes
+            PROCESS_QUERY_INFO = 0x0400
+            STILL_ACTIVE = 259
+            k = ctypes.windll.kernel32
+            h = k.OpenProcess(PROCESS_QUERY_INFO, False, pid_int)
+            if not h:
+                return False
+            try:
+                code = ctypes.c_ulong()
+                ok = k.GetExitCodeProcess(h, ctypes.byref(code))
+                return bool(ok and code.value == STILL_ACTIVE)
+            finally:
+                k.CloseHandle(h)
+        else:
+            os.kill(pid_int, 0)
+            return True
+    except Exception:
+        return False
+
+
+def read_lock_info(case_id: str) -> dict | None:
+    """Return the parsed lock dict, or None if no lock file, or
+    {"_invalid": True, ...} if the file exists but cannot be parsed."""
+    p = _lock_path(case_id)
+    if not p.exists():
+        return None
+    try:
+        info = json.loads(p.read_text(encoding="utf-8"))
+        if not isinstance(info, dict):
+            return {"_invalid": True, "reason": "not a JSON object"}
+        return info
+    except Exception as e:
+        return {"_invalid": True, "reason": f"unreadable: {e}"}
+
+
+def is_lock_stale(info: dict | None) -> bool:
+    """A lock is stale when either:
+      - it is invalid/corrupt, OR
+      - started_at is missing/unparseable, OR
+      - age > PIPELINE_LOCK_STALE_HOURS.
+    PID liveness is NOT consulted here (informational only).
+    """
+    if not info:
+        return False
+    if info.get("_invalid"):
+        return True
+    started_at = info.get("started_at", "")
+    try:
+        age = datetime.now() - datetime.fromisoformat(started_at)
+    except Exception:
+        return True
+    return age > timedelta(hours=PIPELINE_LOCK_STALE_HOURS)
+
+
+def acquire_lock(case_id: str, start_step: int) -> dict | None:
+    """Atomically create the .pipeline.lock for case_id.
+
+    If an existing lock is stale/invalid, it is replaced. If an existing
+    lock is active, returns None (caller must abort). On success returns
+    the freshly-written lock dict.
+    """
+    p = _lock_path(case_id)
+    p.parent.mkdir(parents=True, exist_ok=True)
+
+    if p.exists():
+        existing = read_lock_info(case_id)
+        if existing and not is_lock_stale(existing):
+            return None  # active lock — refuse
+        # Stale or invalid → safe to replace
+        try:
+            p.unlink()
+        except Exception:
+            pass
+
+    info = {
+        "case_id":    case_id,
+        "started_at": datetime.now().isoformat(timespec="seconds"),
+        "pid":        os.getpid(),
+        "host":       socket.gethostname(),
+        "user":       getpass.getuser(),
+        "start_step": int(start_step),
+    }
+    try:
+        # "x" mode = create-exclusive; fails if another writer raced us
+        with open(p, "x", encoding="utf-8") as f:
+            f.write(json.dumps(info, ensure_ascii=False, indent=2))
+        return info
+    except FileExistsError:
+        return None
+
+
+def release_lock(case_id: str) -> None:
+    """Delete .pipeline.lock if present. Idempotent and never raises."""
+    p = _lock_path(case_id)
+    try:
+        if p.exists():
+            p.unlink()
+    except Exception:
+        pass  # best-effort; another release path will catch it next time
 
 
 # ── Sidebar ──────────────────────────────────────────────────────────────────
@@ -554,20 +686,81 @@ if mode == "Select Existing Case":
     else:
         st.info("\U0001f4a1 \u5c1a\u672a\u5206\u6790\u6587\u4ef6\u683c\u5f0f\uff0cRun Full Pipeline \u6642\u6703\u81ea\u52d5\u5206\u6790\u4e26\u5132\u5b58\u81f3 meta/doc_schema.json")
 
-    # ── Buttons (disabled while running) ──
+    # ── Pipeline lock state (computed BEFORE buttons so we can gate them) ──
+    _lock_info   = read_lock_info(selected_case)
+    _lock_stale  = is_lock_stale(_lock_info) if _lock_info else False
+    _lock_active = bool(_lock_info) and not _lock_stale
+
+    if _lock_active:
+        _li = _lock_info or {}
+        _pid_val = _li.get("pid")
+        _pid_dead_hint = ""
+        if _li.get("host") == socket.gethostname() and _pid_val and not _pid_alive(_pid_val):
+            _pid_dead_hint = "  ⚠ PID no longer running on this host"
+        st.warning(
+            "🔒 **This case is currently being processed by another session.**  \n"
+            f"started_at: `{_li.get('started_at', '?')}` · "
+            f"host: `{_li.get('host', '?')}` · "
+            f"pid: `{_pid_val}` · "
+            f"user: `{_li.get('user', '?')}`  \n"
+            f"start_step: `{_li.get('start_step', '?')}`"
+            f"{_pid_dead_hint}"
+        )
+    elif _lock_info and _lock_stale:
+        _li = _lock_info
+        if _li.get("_invalid"):
+            st.warning(
+                "⚠️ **Lock file is invalid / corrupt** — safe to clear.  \n"
+                f"reason: `{_li.get('reason', '?')}`"
+            )
+        else:
+            _started = _li.get("started_at", "?")
+            _age_str = "?"
+            try:
+                _age = datetime.now() - datetime.fromisoformat(_started)
+                _age_str = f"{int(_age.total_seconds() / 60)} min ago"
+            except Exception:
+                pass
+            st.warning(
+                f"⚠️ **Stale lock detected** (older than {PIPELINE_LOCK_STALE_HOURS}h) — "
+                "previous run likely crashed without releasing.  \n"
+                f"started_at: `{_started}` ({_age_str}) · "
+                f"host: `{_li.get('host', '?')}` · "
+                f"pid: `{_li.get('pid', '?')}` · "
+                f"user: `{_li.get('user', '?')}` · "
+                f"start_step: `{_li.get('start_step', '?')}`"
+            )
+        if st.button("🗑️ Clear Stale Lock", key=f"clear_stale_lock_{selected_case}"):
+            release_lock(selected_case)
+            st.success("Stale lock cleared.")
+            st.rerun()
+
+    # ── Buttons (disabled while running OR while another session holds the lock) ──
     col_btn1, col_btn2, col_btn3 = st.columns([1, 1, 1])
     with col_btn1:
-        btn_label = "⏳  Pipeline Running…" if st.session_state.pipeline_running else "► Run Full Pipeline"
-        run_all = st.button(btn_label, type="primary", disabled=st.session_state.pipeline_running,
+        if _lock_active:
+            btn_label = "🔒  Locked by another session"
+        elif st.session_state.pipeline_running:
+            btn_label = "⏳  Pipeline Running…"
+        else:
+            btn_label = "► Run Full Pipeline"
+        run_all = st.button(btn_label, type="primary",
+                            disabled=st.session_state.pipeline_running or _lock_active,
                             use_container_width=True, help="Step 1 (LLM) + Step 2 + Step 3 + Step 4")
     with col_btn2:
-        btn_label2 = "⏳  Pipeline Running…" if st.session_state.pipeline_running else "⚡ Enrich + Format + Export"
-        run_partial = st.button(btn_label2, disabled=st.session_state.pipeline_running,
+        if _lock_active:
+            btn_label2 = "🔒  Locked by another session"
+        elif st.session_state.pipeline_running:
+            btn_label2 = "⏳  Pipeline Running…"
+        else:
+            btn_label2 = "⚡ Enrich + Format + Export"
+        run_partial = st.button(btn_label2,
+                                disabled=st.session_state.pipeline_running or _lock_active,
                                 use_container_width=True, help="Skip Step 1 (LLM) — use when only rules or .py files changed")
     with col_btn3:
         reset_partial = st.button(
             "🗑️ Reset Extract (Re-extract)",
-            disabled=(not partial_exists) or st.session_state.pipeline_running,
+            disabled=(not partial_exists) or st.session_state.pipeline_running or _lock_active,
             use_container_width=True,
             help="Delete partial.jsonl so the next Full Pipeline re-extracts from scratch",
         )
@@ -598,55 +791,72 @@ if mode == "Select Existing Case":
     # ── Execute pipeline — use st.status for real-time step visibility ──
     if st.session_state.pipeline_should_run:
         st.session_state.pipeline_should_run = False
-        all_ok = True
-        start_step = st.session_state.pipeline_start_step
 
-        with st.status("Running pipeline…", expanded=True) as status:
-            for idx, step in enumerate(PIPELINE_STEPS):
-                label = step["label"]
+        # Acquire case-level lock BEFORE running any subprocess.
+        # If another session won the race between button click and execution,
+        # bail out cleanly without touching their lock file.
+        _acquired = acquire_lock(selected_case, st.session_state.pipeline_start_step)
+        if _acquired is None:
+            st.session_state.pipeline_running = False
+            st.error(
+                "🔒 Could not acquire pipeline lock — another session is "
+                "currently running for this case. Please retry after it finishes."
+            )
+            st.rerun()
+        else:
+            all_ok = True
+            start_step = st.session_state.pipeline_start_step
 
-                # Skip steps before start_step
-                if idx < start_step:
-                    st.write(f"⏭  Skipped: {label}")
-                    st.session_state.pipeline_step_results.append(
-                        {"ok": True, "label": label, "ok_msg": "Skipped", "rc": 0, "output": "Skipped (Steps 2–4 mode)"}
-                    )
-                    continue
+            try:
+                with st.status("Running pipeline…", expanded=True) as status:
+                    for idx, step in enumerate(PIPELINE_STEPS):
+                        label = step["label"]
 
-                if step["requires_api_key"] and not has_api_key:
-                    st.write(f"⏭  Skipped: {label} — OPENAI_API_KEY not set.")
-                    st.session_state.pipeline_step_results.append(
-                        {"ok": False, "label": label, "ok_msg": "", "rc": -1,
-                         "output": "OPENAI_API_KEY not set — step skipped."}
-                    )
-                    all_ok = False
-                    break
+                        # Skip steps before start_step
+                        if idx < start_step:
+                            st.write(f"⏭  Skipped: {label}")
+                            st.session_state.pipeline_step_results.append(
+                                {"ok": True, "label": label, "ok_msg": "Skipped", "rc": 0, "output": "Skipped (Steps 2–4 mode)"}
+                            )
+                            continue
 
-                st.write(f"▶  {label}…")
-                rc, output = run_step(step["cmd"])
+                        if step["requires_api_key"] and not has_api_key:
+                            st.write(f"⏭  Skipped: {label} — OPENAI_API_KEY not set.")
+                            st.session_state.pipeline_step_results.append(
+                                {"ok": False, "label": label, "ok_msg": "", "rc": -1,
+                                 "output": "OPENAI_API_KEY not set — step skipped."}
+                            )
+                            all_ok = False
+                            break
 
-                if rc == 0:
-                    st.write(f"✅  {label} — {step['ok_msg']}")
-                else:
-                    st.write(f"❌  {label} failed (exit code {rc})")
+                        st.write(f"▶  {label}…")
+                        rc, output = run_step(step["cmd"])
 
-                st.session_state.pipeline_step_results.append(
-                    {"ok": rc == 0, "label": label, "ok_msg": step["ok_msg"], "rc": rc, "output": output}
-                )
+                        if rc == 0:
+                            st.write(f"✅  {label} — {step['ok_msg']}")
+                        else:
+                            st.write(f"❌  {label} failed (exit code {rc})")
 
-                if rc != 0:
-                    all_ok = False
-                    break
+                        st.session_state.pipeline_step_results.append(
+                            {"ok": rc == 0, "label": label, "ok_msg": step["ok_msg"], "rc": rc, "output": output}
+                        )
 
+                        if rc != 0:
+                            all_ok = False
+                            break
+
+                    if all_ok:
+                        status.update(label="✅  Pipeline completed successfully", state="complete", expanded=False)
+                    else:
+                        status.update(label="❌  Pipeline failed — see log below", state="error", expanded=True)
+            finally:
+                # Always release the lock — success, failed step, or unhandled exception.
+                release_lock(selected_case)
+
+            st.session_state.pipeline_running = False
             if all_ok:
-                status.update(label="✅  Pipeline completed successfully", state="complete", expanded=False)
-            else:
-                status.update(label="❌  Pipeline failed — see log below", state="error", expanded=True)
-
-        st.session_state.pipeline_running = False
-        if all_ok:
-            st.session_state.pipeline_done = True
-        st.rerun()  # re-render: show stored results + refresh outputs
+                st.session_state.pipeline_done = True
+            st.rerun()  # re-render: show stored results + refresh outputs
 
     # ── Display stored step results ──
     for res in st.session_state.pipeline_step_results:
