@@ -355,36 +355,40 @@ def _load_reqs(data: Dict[str, Any]) -> List[Dict[str, Any]]:
     return out
 
 
-def split_sheets(reqs: List[Dict[str, Any]]) -> Tuple[List, List, List]:
-    glossary, notes, main = [], [], []
-    for r in reqs:
-        status = str(r.get("status") or "")
-        cat_str = _category_str(r.get("category", []))
-        owner = str(r.get("owner") or "")
-        must_level = str(r.get("must_level") or "").upper()
-        req_text = str(r.get("requirement") or "")
+def split_sheets(reqs: List[Dict[str, Any]]) -> Tuple[List, List, List, List]:
+    """Route items into 4 buckets — main / glossary / notes / skipped.
 
-        is_glossary = (status == "AUTO_SKIP") or ("glossary" in cat_str.lower())
-        if is_glossary:
+    Routing precedence (first match wins):
+      1. Glossary   — type == "glossary"  OR  risk_tags contains "GLOSSARY"
+      2. Notes      — type == "note"
+      3. Skipped    — type == "junk"  OR  status == "AUTO_SKIP"
+                      (catches obvious-noise rows: dates, names, ticks, etc.,
+                       and any AUTO_SKIP rows that weren't glossary/note —
+                       e.g., short colon-prefixed values the enricher
+                       mis-tagged.)
+      4. Main       — everything else (real requirements)
+    """
+    main, glossary, notes, skipped = [], [], [], []
+    for r in reqs:
+        req_type = str(r.get("type") or "").lower()
+        status   = str(r.get("status") or "").upper()
+        raw_tags = r.get("risk_tags") or []
+        if not isinstance(raw_tags, list):
+            raw_tags = [raw_tags]
+        tag_set = {str(t).upper() for t in raw_tags}
+
+        if req_type == "glossary" or "GLOSSARY" in tag_set:
             glossary.append(r)
             continue
-
-        msgs = r.get("risk_tags") or r.get("redflag_tags") or r.get("redflag_messages") or []
-        has_redflag = bool(msgs and str(msgs) not in ("[]", ""))
-        req_type = str(r.get("type") or "")
-
-        is_note = (
-            must_level in ("INFO", "")
-            and status != "NEED_REVIEW"
-            and not has_redflag
-            and req_type in ("note", "junk")
-        )
-        if is_note:
+        if req_type == "note":
             notes.append(r)
-        else:
-            main.append(r)
+            continue
+        if req_type == "junk" or status == "AUTO_SKIP":
+            skipped.append(r)
+            continue
+        main.append(r)
 
-    return main, glossary, notes
+    return main, glossary, notes, skipped
 
 
 def apply_sheet_style(ws) -> None:
@@ -523,7 +527,7 @@ def export_excel(data: Dict[str, Any], out_xlsx: Path, responses_path: Optional[
     wb.remove(wb.active)
 
     reqs = _load_reqs(data)
-    main_reqs, glossary_reqs, notes_reqs = split_sheets(reqs)
+    main_reqs, glossary_reqs, notes_reqs, skipped_reqs = split_sheets(reqs)
 
     # Merge owner responses into main_reqs
     for r in main_reqs:
@@ -575,6 +579,7 @@ def export_excel(data: Dict[str, Any], out_xlsx: Path, responses_path: Optional[
 
     write_sheet(wb.create_sheet("Glossary"), glossary_reqs)
     write_sheet(wb.create_sheet("Notes"),    notes_reqs)
+    write_sheet(wb.create_sheet("Skipped"),  skipped_reqs)
 
     out_xlsx.parent.mkdir(parents=True, exist_ok=True)
     wb.save(out_xlsx)
@@ -630,7 +635,8 @@ def main():
     print(f"[OK] Output: {out_path}")
     print("[OK] Sheets: Compliance Matrix, By_Category_Summary, "
           "3. Hardware, 4. Software, 5. Mechanical, "
-          "6. Regulatory, 7. Environmental, 8. Others, Glossary, Notes")
+          "6. Regulatory, 7. Environmental, 8. Others, "
+          "Glossary, Notes, Skipped")
 
 
 if __name__ == "__main__":
