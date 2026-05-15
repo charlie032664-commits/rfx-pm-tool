@@ -27,6 +27,7 @@ HEADERS = [
     "Priority",
     "Category",
     "Responsible Team",
+    "Stakeholder",
     "Compliance Status",
     "Requirement (Original)",
     # ── Phase 4.6 normalization output (filled by normalize_requirements_llm.py)
@@ -418,6 +419,7 @@ def apply_sheet_style(ws) -> None:
     wrap_cols = {
         "Requirement (Original)",
         "Requirement (Normalized)",
+        "Stakeholder",
         "Risk Tags",
         "Our Response",
         "Gap / Notes",
@@ -439,6 +441,7 @@ def apply_sheet_style(ws) -> None:
         "Priority": 12,
         "Category": 15,
         "Responsible Team": 14,
+        "Stakeholder": 22,
         "Compliance Status": 18,
         "Requirement (Original)": 60,
         "Requirement (Normalized)": 60,
@@ -524,6 +527,12 @@ def write_sheet(ws, reqs: List[Dict[str, Any]]) -> None:
         must_level  = r.get("must_level", "")
         category    = _category_str(r.get("category", []))
         owner       = r.get("owner", "")
+        # Stakeholder — list of additional involved teams, comma-joined
+        _sh = r.get("stakeholder") or []
+        if isinstance(_sh, list):
+            stakeholder = ", ".join(str(s).strip() for s in _sh if str(s).strip())
+        else:
+            stakeholder = str(_sh).strip()
         status      = r.get("status", "")
         req_text    = r.get("requirement", "")
         source      = _source_ref(r)
@@ -551,7 +560,7 @@ def write_sheet(ws, reqs: List[Dict[str, Any]]) -> None:
         review_str = "REVIEW" if needs_review else ""
 
         ws.append([
-            req_id, must_level, category, owner, status,
+            req_id, must_level, category, owner, stakeholder, status,
             req_text,
             normalized, rewrite_reason, conf_str, review_str,
             risk_str,
