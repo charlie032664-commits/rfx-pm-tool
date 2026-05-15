@@ -29,6 +29,12 @@ HEADERS = [
     "Responsible Team",
     "Compliance Status",
     "Requirement (Original)",
+    # ── Phase 4.6 normalization output (filled by normalize_requirements_llm.py)
+    "Requirement (Normalized)",
+    "Rewrite Reason",
+    "Rewrite Confidence",
+    "Rewrite Review",
+    # ── existing columns continue ──
     "Risk Tags",
     "Our Response",
     "Gap / Notes",
@@ -411,6 +417,7 @@ def apply_sheet_style(ws) -> None:
 
     wrap_cols = {
         "Requirement (Original)",
+        "Requirement (Normalized)",
         "Risk Tags",
         "Our Response",
         "Gap / Notes",
@@ -434,6 +441,10 @@ def apply_sheet_style(ws) -> None:
         "Responsible Team": 14,
         "Compliance Status": 18,
         "Requirement (Original)": 60,
+        "Requirement (Normalized)": 60,
+        "Rewrite Reason": 24,
+        "Rewrite Confidence": 12,
+        "Rewrite Review": 10,
         "Risk Tags": 22,
         "Our Response": 50,
         "Gap / Notes": 35,
@@ -445,10 +456,42 @@ def apply_sheet_style(ws) -> None:
         if h in HIDDEN_COLS:
             ws.column_dimensions[get_column_letter(idx)].hidden = True
 
-    # Conditional formatting by Status
+    # Conditional formatting
     if ws.max_row >= 2:
         last_col = get_column_letter(ws.max_column)
         data_range = f"A2:{last_col}{ws.max_row}"
+
+        # ── Phase 4.6 normalization highlighting ───────────────────────────
+        # Insert FIRST + stopIfTrue=True so the column-specific Normalized /
+        # Review colour wins over the row-wide Status colour added below.
+        if "Requirement (Normalized)" in HEADERS and "Rewrite Review" in HEADERS:
+            nc  = HEADERS.index("Requirement (Normalized)") + 1
+            ncl = get_column_letter(nc)
+            rc  = HEADERS.index("Rewrite Review") + 1
+            rcl = get_column_letter(rc)
+            # Normalized cell → light yellow when row is flagged REVIEW
+            ws.conditional_formatting.add(
+                f"{ncl}2:{ncl}{ws.max_row}",
+                FormulaRule(formula=[f'${rcl}2="REVIEW"'],
+                            fill=PatternFill("solid", fgColor="FFE699"),
+                            stopIfTrue=True)
+            )
+            # Normalized cell → light green when normalized has content and not REVIEW
+            ws.conditional_formatting.add(
+                f"{ncl}2:{ncl}{ws.max_row}",
+                FormulaRule(formula=[f'AND(${ncl}2<>"",${rcl}2<>"REVIEW")'],
+                            fill=PatternFill("solid", fgColor="DDF0E0"),
+                            stopIfTrue=True)
+            )
+            # Review cell → bold yellow when "REVIEW"
+            ws.conditional_formatting.add(
+                f"{rcl}2:{rcl}{ws.max_row}",
+                FormulaRule(formula=[f'${rcl}2="REVIEW"'],
+                            fill=PatternFill("solid", fgColor="FFD966"),
+                            stopIfTrue=True)
+            )
+
+        # ── Status row colouring (lower priority; added AFTER Normalized) ──
         sc = HEADERS.index("Compliance Status") + 1
         sl = get_column_letter(sc)
         _status_colors = [
@@ -492,9 +535,26 @@ def write_sheet(ws, reqs: List[Dict[str, Any]]) -> None:
         gap_notes    = r.get("gap") or ""
         evidence     = r.get("evidence_needed") or r.get("evidence") or ""
 
+        # ── Phase 4.6 normalization fields ──
+        normalized     = (r.get("normalized_requirement") or "").strip()
+        rewrite_reason = (r.get("rewrite_reason") or "").strip()
+        rewrite_conf   = r.get("rewrite_confidence", 0.0)
+        needs_review   = bool(r.get("needs_rewrite_review", False))
+        # Confidence shows "0.00" only when normalize was attempted; blank otherwise
+        if rewrite_reason:
+            try:
+                conf_str = f"{float(rewrite_conf):.2f}"
+            except (TypeError, ValueError):
+                conf_str = "0.00"
+        else:
+            conf_str = ""
+        review_str = "REVIEW" if needs_review else ""
+
         ws.append([
             req_id, must_level, category, owner, status,
-            req_text, risk_str,
+            req_text,
+            normalized, rewrite_reason, conf_str, review_str,
+            risk_str,
             our_response, gap_notes, evidence,
             source,
         ])
