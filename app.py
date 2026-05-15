@@ -88,6 +88,12 @@ if "pipeline_should_run"   not in st.session_state: st.session_state.pipeline_sh
 if "pipeline_step_results" not in st.session_state: st.session_state.pipeline_step_results = []
 if "pipeline_start_step"   not in st.session_state: st.session_state.pipeline_start_step   = 0
 if "responses_manager"     not in st.session_state: st.session_state.responses_manager     = None
+# Phase 4.6C — Normalize Requirements UI state
+if "normalize_running"      not in st.session_state: st.session_state.normalize_running      = False
+if "normalize_should_run"   not in st.session_state: st.session_state.normalize_should_run   = False
+if "normalize_step_results" not in st.session_state: st.session_state.normalize_step_results = []
+if "normalize_sample_mode"  not in st.session_state: st.session_state.normalize_sample_mode  = "sample10"
+if "normalize_force"        not in st.session_state: st.session_state.normalize_force        = False
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -212,6 +218,29 @@ def run_step(cmd: list) -> tuple[int, str]:
     )
     output = (result.stdout + result.stderr).strip()
     return result.returncode, output
+
+
+def _parse_normalize_summary(output: str) -> dict:
+    """Parse the '=== Summary ===' block emitted by normalize_requirements_llm.py.
+
+    Returns a dict of integer counters keyed by the script's stat names
+    (e.g. processed, skipped_idempotent, already_complete, ...).
+    Returns {} when parsing fails — caller should fall back to clean.json stats.
+    """
+    if not output:
+        return {}
+    try:
+        m = re.search(r"===\s*Summary\s*===(.*?)(?:\n\n===|\Z)", output, re.DOTALL)
+        if not m:
+            return {}
+        out: dict = {}
+        for line in m.group(1).splitlines():
+            mm = re.match(r"\s+(\w[\w_]*)\s*:\s*(\d+)\s*$", line)
+            if mm:
+                out[mm.group(1)] = int(mm.group(2))
+        return out
+    except Exception:
+        return {}
 
 
 # ── File selection (Step 1.5: PM marks include/exclude before pipeline) ─────
@@ -1139,6 +1168,279 @@ else:
                 if fpath.exists():
                     size_kb = fpath.stat().st_size / 1024
                     st.success(f"**{label}** — `{filename}` ({size_kb:.1f} KB)")
+
+st.divider()
+
+# ── Step 3.5: Normalize Requirements (Phase 4.6C, optional, opt-in) ──────────
+
+if mode == "Select Existing Case":
+    st.subheader("Step 3.5: Normalize Requirements (optional)")
+    st.markdown(
+        "<p style='font-size:1.0rem;color:#455A64;margin-bottom:6px;'>"
+        "Use the LLM to rewrite fragment-style requirements into complete, "
+        "verifiable, standalone form. Adds 4 columns to "
+        "<code>compliance_matrix.xlsx</code>. <b>Does NOT change</b> "
+        "<code>req_id</code> or the original requirement text.</p>",
+        unsafe_allow_html=True,
+    )
+
+    _norm_clean_p = RUNS_DIR / selected_case / "requirements_clean.json"
+    if not _norm_clean_p.exists():
+        st.info(
+            "ℹ️ Run the pipeline first (Step 2) to produce "
+            "`requirements_clean.json` before normalization."
+        )
+    else:
+        # ── Read clean.json for eligibility + cumulative stats ──
+        try:
+            _norm_clean = json.loads(_norm_clean_p.read_text(encoding="utf-8"))
+            _norm_items = _norm_clean.get("items", [])
+        except Exception:
+            _norm_items = []
+        _norm_eligible = [
+            i for i in _norm_items if (i.get("type") or "").lower() == "requirement"
+        ]
+        _norm_already = sum(
+            1 for i in _norm_eligible
+            if (i.get("rewrite_reason") or "").strip()
+            and (i.get("rewrite_reason") or "").strip() != "not_attempted"
+        )
+        _norm_remaining = len(_norm_eligible) - _norm_already
+
+        # ── LLM availability ──
+        _norm_provider = os.environ.get("LLM_PROVIDER", "").strip().lower()
+        _norm_has_api = bool(os.environ.get("OPENAI_API_KEY")) or _norm_provider == "internal"
+
+        # ── Lock state (shared with Phase 2 pipeline lock) ──
+        _norm_lock_info  = read_lock_info(selected_case)
+        _norm_lock_stale = is_lock_stale(_norm_lock_info) if _norm_lock_info else False
+        _norm_lock_active = bool(_norm_lock_info) and not _norm_lock_stale
+
+        # ── Mode selectbox + force checkbox ──
+        _norm_col_m, _norm_col_f = st.columns([3, 1])
+        _mode_options = ["Sample 10 (default)", "Sample 30", "All eligible items"]
+        _mode_to_internal = {
+            "Sample 10 (default)": "sample10",
+            "Sample 30":            "sample30",
+            "All eligible items":   "all",
+        }
+        _internal_to_mode = {v: k for k, v in _mode_to_internal.items()}
+        _default_label = _internal_to_mode.get(
+            st.session_state.normalize_sample_mode, "Sample 10 (default)"
+        )
+        _picked_label = _norm_col_m.selectbox(
+            "Mode",
+            options=_mode_options,
+            index=_mode_options.index(_default_label),
+            disabled=st.session_state.normalize_running or _norm_lock_active,
+            key=f"normalize_mode_{selected_case}",
+        )
+        st.session_state.normalize_sample_mode = _mode_to_internal[_picked_label]
+        _internal_mode = st.session_state.normalize_sample_mode
+
+        _force_val = _norm_col_f.checkbox(
+            "--force",
+            value=st.session_state.normalize_force,
+            disabled=st.session_state.normalize_running or _norm_lock_active,
+            help="Re-normalize rows that already have rewrite_reason set",
+            key=f"normalize_force_{selected_case}",
+        )
+        st.session_state.normalize_force = _force_val
+
+        # ── "All" confirm checkbox + warnings ──
+        _all_confirmed = True
+        if _internal_mode == "all":
+            st.warning(
+                f"⚠️ **All mode** will process **{_norm_remaining}** remaining items "
+                f"({len(_norm_eligible)} eligible total). "
+                "Estimated 4-7 min, ~$0.50-0.80."
+            )
+            _all_confirmed = st.checkbox(
+                "I understand --all will process all eligible items",
+                value=False,
+                disabled=st.session_state.normalize_running or _norm_lock_active,
+                key=f"normalize_confirm_all_{selected_case}",
+            )
+
+        if not _norm_has_api:
+            st.warning(
+                "⚠️ LLM not configured — set `OPENAI_API_KEY` or "
+                "`LLM_PROVIDER=internal` and restart Streamlit."
+            )
+
+        if _norm_lock_active:
+            st.info(
+                "🔒 Cannot normalize — case is being processed by another session. "
+                "See the lock banner under Step 2 for details."
+            )
+
+        # ── Run button ──
+        _norm_disabled = (
+            st.session_state.normalize_running
+            or _norm_lock_active
+            or not _norm_has_api
+            or (_internal_mode == "all" and not _all_confirmed)
+        )
+        if _norm_lock_active:
+            _norm_btn_label = "🔒  Locked by another session"
+        elif st.session_state.normalize_running:
+            _norm_btn_label = "⏳  Normalize Running…"
+        else:
+            _norm_btn_label = "🪄 Run Normalize"
+        run_normalize = st.button(
+            _norm_btn_label,
+            type="primary",
+            disabled=_norm_disabled,
+            use_container_width=False,
+            key=f"normalize_run_{selected_case}",
+        )
+
+        if run_normalize and not st.session_state.normalize_running:
+            st.session_state.normalize_running      = True
+            st.session_state.normalize_should_run   = True
+            st.session_state.normalize_step_results = []
+            st.rerun()
+
+        if st.session_state.normalize_running:
+            st.info("🔄 Normalize is running… Do not close this tab.")
+
+        # ── Execute normalize when triggered ──
+        if st.session_state.normalize_should_run:
+            st.session_state.normalize_should_run = False
+            # Acquire same case-level lock as pipeline (Phase 2)
+            _norm_acq = acquire_lock(selected_case, 0)
+            if _norm_acq is None:
+                st.session_state.normalize_running = False
+                st.error(
+                    "🔒 Could not acquire pipeline lock — another session "
+                    "started running for this case. Retry after it finishes."
+                )
+                st.rerun()
+            else:
+                _norm_cmd = [
+                    PYTHON,
+                    str(AI_RFX_DIR / "normalize_requirements_llm.py"),
+                    "--case", selected_case,
+                ]
+                if _internal_mode == "sample10":
+                    _norm_cmd += ["--sample", "10"]
+                elif _internal_mode == "sample30":
+                    _norm_cmd += ["--sample", "30"]
+                elif _internal_mode == "all":
+                    _norm_cmd += ["--all"]
+                if st.session_state.normalize_force:
+                    _norm_cmd += ["--force"]
+
+                _norm_case_runs = RUNS_DIR / selected_case
+                _norm_export_cmd = [
+                    PYTHON,
+                    str(AI_RFX_DIR / "export_excel.py"),
+                    "--in",  str(_norm_case_runs / "requirements_clean.json"),
+                    "--out", str(_norm_case_runs / "compliance_matrix.xlsx"),
+                    "--responses", str(RESPONSES_DIR / selected_case / "responses.json"),
+                ]
+
+                _NORMALIZE_STEPS = [
+                    {"label": "Normalize — LLM rewrite",                "cmd": _norm_cmd},
+                    {"label": "Export — refresh compliance_matrix.xlsx", "cmd": _norm_export_cmd},
+                ]
+
+                _all_ok = True
+                try:
+                    with st.status("Running normalize…", expanded=True) as _norm_status:
+                        for _step in _NORMALIZE_STEPS:
+                            _lbl = _step["label"]
+                            st.write(f"▶  {_lbl}…")
+                            _rc, _out = run_step(_step["cmd"])
+                            if _rc == 0:
+                                st.write(f"✅  {_lbl}")
+                            else:
+                                st.write(f"❌  {_lbl} failed (exit code {_rc})")
+                            st.session_state.normalize_step_results.append(
+                                {"ok": _rc == 0, "label": _lbl, "rc": _rc, "output": _out}
+                            )
+                            if _rc != 0:
+                                _all_ok = False
+                                break
+                        if _all_ok:
+                            _norm_status.update(
+                                label="✅ Normalize complete",
+                                state="complete", expanded=False,
+                            )
+                        else:
+                            _norm_status.update(
+                                label="❌ Normalize failed — see log below",
+                                state="error", expanded=True,
+                            )
+                finally:
+                    release_lock(selected_case)
+
+                st.session_state.normalize_running = False
+                st.rerun()
+
+        # ── Display stored step results ──
+        for _res in st.session_state.normalize_step_results:
+            if _res["ok"]:
+                st.success(f"✅  {_res['label']}")
+            else:
+                st.error(f"❌  {_res['label']} failed (exit code {_res['rc']})")
+            if _res["output"]:
+                with st.expander(f"Log: {_res['label']}", expanded=not _res["ok"]):
+                    st.code(_res["output"], language="text")
+
+        # ── This run summary (parsed from stdout; silent fallback if parse fails) ──
+        if st.session_state.normalize_step_results:
+            _norm_res = next(
+                (r for r in st.session_state.normalize_step_results
+                 if "Normalize" in r["label"]),
+                None,
+            )
+            if _norm_res and _norm_res.get("output"):
+                _summary = _parse_normalize_summary(_norm_res["output"])
+                if _summary:
+                    st.markdown("**This run:**")
+                    _c1, _c2, _c3, _c4, _c5 = st.columns(5)
+                    _c1.metric("Processed",         _summary.get("processed", 0))
+                    _c2.metric("Skipped",           _summary.get("skipped_idempotent", 0))
+                    _c3.metric("Already Complete",  _summary.get("already_complete", 0))
+                    _c4.metric("Fragment→Std",      _summary.get("fragment_to_standalone", 0))
+                    _c5.metric("Needs Review",      _summary.get("needs_review_set", 0))
+
+        # ── Case cumulative state (always shown, even before any normalize run) ──
+        if _norm_items:
+            _cum_norm = sum(
+                1 for i in _norm_items if (i.get("normalized_requirement") or "").strip()
+            )
+            _cum_review = sum(1 for i in _norm_items if i.get("needs_rewrite_review"))
+            _cum_reasons: dict = {}
+            for i in _norm_items:
+                _rsn = (i.get("rewrite_reason") or "").strip()
+                if _rsn:
+                    _cum_reasons[_rsn] = _cum_reasons.get(_rsn, 0) + 1
+            with st.expander("📊 Case cumulative state (from clean.json)", expanded=False):
+                st.markdown(
+                    f"- normalized_requirement non-empty: **{_cum_norm}** / "
+                    f"{len(_norm_items)} items\n"
+                    f"- needs_rewrite_review flagged: **{_cum_review}**\n"
+                    f"- eligible (type=requirement): **{len(_norm_eligible)}**\n"
+                    f"- already normalized: **{_norm_already}**, remaining: **{_norm_remaining}**"
+                )
+                if _cum_reasons:
+                    st.markdown("rewrite_reason distribution:")
+                    for _r, _n in sorted(_cum_reasons.items()):
+                        st.markdown(f"  - `{_r}`: {_n}")
+
+        # ── Download button for refreshed Excel ──
+        _norm_xlsx = RUNS_DIR / selected_case / "compliance_matrix.xlsx"
+        if _norm_xlsx.exists():
+            _xlsx_size_kb = _norm_xlsx.stat().st_size / 1024
+            st.download_button(
+                label=f"📥 Download Compliance Matrix ({_xlsx_size_kb:.1f} KB)",
+                data=_norm_xlsx.read_bytes(),
+                file_name="compliance_matrix.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key=f"dl_normalize_xlsx_{selected_case}",
+            )
 
 st.divider()
 st.subheader("Step 4: Review & Fill")
