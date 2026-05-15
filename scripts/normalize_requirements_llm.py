@@ -51,6 +51,11 @@ sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 # environment that extract / enrich already use.
 from llm_client import get_client, get_model, is_available, parse_json_response
 
+# Phase 4.7A: load prompt from skills/ instead of inline f-string.
+# Add the project root (parent of scripts/) to sys.path so `import skills` works.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from skills import load_skill
+
 
 # ── Paths ────────────────────────────────────────────────────────────────────
 
@@ -129,74 +134,17 @@ _SYSTEM = (
     "Output STRICT JSON only. No markdown, no prose, no code fences."
 )
 
+# Phase 4.7A: prompt body now lives in skills/requirement_normalization.md.
+# Loaded once per process (cached); guards / safeguards / JSON parsing /
+# LLM call / CLI behaviour are unchanged from the inline-f-string era.
+_SKILL = None
+
 
 def _build_prompt(payload: Dict[str, Any]) -> str:
-    return f"""你是 RFQ Requirements 規範化助手。任務：依「現有 input」把片段或語意不完整的
-requirement，改寫成完整、可獨立閱讀、可驗證的 standalone requirement。
-
-【嚴格約束】
-1. 你「只能」使用 input 中已有的資訊（original / notes / source / category）。
-2. 你「絕對不可」加入 input 中沒有的：
-   - 數字、單位（GB / MHz / V / W / mm / °C / RU / pin / core / inch...）
-   - 版本號、型號代碼（DDR5 / PCIe 4.0 / ST33KTPMQ / Redfish 1.8 ...）
-   - 標準名稱（FCC / CE / UL / RoHS / FIPS / IEC60950 / IEEE802 ...）
-   - 介面、元件、廠商名稱
-3. 若 input 已是完整 standalone requirement（含 shall/must/required/comply）→
-   rewrite_reason="already_complete"，normalized_requirement 留空字串，confidence=1.0。
-4. 若是片段（無動詞、無完整句）→ 改寫成完整句，
-   rewrite_reason="fragment_to_standalone"。
-5. 若 doc_schema_format=simple_list 且 notes 包含 answer/clarification →
-   以 answer 為意圖來源，original (Question) 當 context，
-   rewrite_reason="qa_answer_to_requirement"。
-6. 若資訊不足以判斷 customer 真正要什麼 → rewrite_reason="ambiguous_needs_review"，
-   needs_rewrite_review=true，normalized 用最保守版本或留空。
-7. 你「絕對不可」改變 req_id / status / owner / category。
-8. notes/comment 不可單獨拆成新的 requirement。
-
-【Output strict JSON only】
-{{
-  "normalized_requirement": "...",
-  "rewrite_reason":         "already_complete | fragment_to_standalone | qa_answer_to_requirement | ambiguous_needs_review | no_rewrite",
-  "rewrite_confidence":     0.0,
-  "needs_rewrite_review":   false,
-  "citations":              ["...exact substring from input I used..."]
-}}
-
-【Examples】
-
-Input:
-  original = "x86 CPU, AMD or Intel CPU"
-Output:
-  {{"normalized_requirement": "The host system shall use an x86 CPU, either AMD or Intel.",
-    "rewrite_reason": "fragment_to_standalone", "rewrite_confidence": 0.9,
-    "needs_rewrite_review": false,
-    "citations": ["x86 CPU", "AMD or Intel CPU"]}}
-
-Input:
-  original = "Must support TPM 2.0 using STM ST33KTPMQ"
-Output:
-  {{"normalized_requirement": "", "rewrite_reason": "already_complete",
-    "rewrite_confidence": 1.0, "needs_rewrite_review": false, "citations": []}}
-
-Input:
-  original = "DDR5, ECC Memory Config1- 16GB (1x16GB), Config2-16GB (2x8GB)"
-Output:
-  {{"normalized_requirement": "The host shall support DDR5 ECC memory in two configurations: Config 1 with 16GB (1x16GB) and Config 2 with 16GB (2x8GB).",
-    "rewrite_reason": "fragment_to_standalone", "rewrite_confidence": 0.92,
-    "needs_rewrite_review": false,
-    "citations": ["DDR5", "ECC Memory", "16GB (1x16GB)", "16GB (2x8GB)"]}}
-
-【Bad example — DO NOT do this】
-
-Input:
-  original = "x86 CPU, AMD or Intel CPU"
-Bad Output (含 hallucination):
-  "The host shall use an x86 CPU running at minimum 2.0 GHz with 8 cores from AMD or Intel."
-  ↑ 錯誤：原文沒有 2.0 GHz / 8 cores。
-
-【Now process this input】
-{json.dumps(payload, ensure_ascii=False, indent=2)}
-""".strip()
+    global _SKILL
+    if _SKILL is None:
+        _SKILL = load_skill("requirement_normalization")
+    return _SKILL.render(payload)
 
 
 # ── Per-item processing ──────────────────────────────────────────────────────
