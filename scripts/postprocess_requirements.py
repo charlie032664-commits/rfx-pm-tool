@@ -40,12 +40,95 @@ _RFQ_TABLE_ID_PATTERNS = [
     re.compile(r"^ROW_ID=\d+$"),
 ]
 
-# Global AI sequence counter (single stream across all sources)
+# Global AI sequence counter — used for *all* system-generated ids.
+# Phase 4 ID policy (revised):
+#   - RFQ-* : customer-supplied id from a trusted structured source
+#             (e.g. IBM table [ROW_ID=HOST-1] → RFQ-HOST-001,
+#              Nokia simple_list xlsx ID column "1" → RFQ-001)
+#   - AI-NNN: system-generated when no trustworthy id exists
+#             (e.g. HPE doc_schema rule="AI auto" → demote any LLM-hallucinated
+#              RFQ-* to AI-NNN)
 _AI_SEQ = {"n": 0}
 
 
 def _reset_ai_seq():
     _AI_SEQ["n"] = 0
+
+
+def _next_ai_id() -> str:
+    """Return next AI-<NNN> with a single global counter."""
+    _AI_SEQ["n"] += 1
+    return f"AI-{_AI_SEQ['n']:03d}"
+
+
+# ── Phase 4: doc_schema-driven req_id grounding ──────────────────────────────
+# Goal: do NOT trust a "RFQ-HOST-NNN"-style req_id unless either:
+#   (a) the source file's `req_id_rule` in inbound/<case>/meta/doc_schema.json
+#       is a structured rule (e.g. "HOST N -> RFQ-HOST-{N:03d}, ..."), or
+#   (b) the requirement text/notes carries a [ROW_ID=...] evidence marker that
+#       confirms the prefix.
+# Otherwise the id is treated as LLM-hallucinated and demoted to AI-<NNN>.
+
+def load_doc_schema(enriched_in_path: Path) -> Dict[str, Any]:
+    """Find inbound/<case>/meta/doc_schema.json given the enriched.json path.
+    Returns {} if not found or unreadable. Best-effort path walk so callers can
+    pass either an absolute or a working-dir-relative path to enriched.json."""
+    p = Path(enriched_in_path)
+    if not p.exists():
+        return {}
+    case_id = p.parent.name
+    for ancestor in p.parents:
+        candidate = ancestor / "inbound" / case_id / "meta" / "doc_schema.json"
+        if candidate.exists():
+            try:
+                data = json.loads(candidate.read_text(encoding="utf-8"))
+                return data if isinstance(data, dict) else {}
+            except Exception:
+                return {}
+    return {}
+
+
+def _file_req_id_rule(doc_schema: Dict[str, Any], filename: str) -> str:
+    """Return the req_id_rule string for the named file.
+
+    Prefers per-file rule from doc_schema.files[]; falls back to the legacy
+    global rule. Returns "" when nothing is set.
+    """
+    if not doc_schema or not filename:
+        return str((doc_schema or {}).get("req_id_rule") or "").strip()
+    for f in (doc_schema.get("files") or []):
+        if f.get("file") == filename:
+            return str(f.get("req_id_rule") or "").strip()
+    return str(doc_schema.get("req_id_rule") or "").strip()
+
+
+def _is_structured_req_id_rule(rule: str) -> bool:
+    """True iff the rule indicates the source file actually carries
+    structured row IDs (not the placeholder 'AI auto')."""
+    if not rule:
+        return False
+    norm = rule.strip().lower()
+    return norm not in ("ai auto", "ai 自動編號", "ai 自动编号")
+
+
+_ROW_ID_EVIDENCE_RE = re.compile(r"\[ROW_ID\s*=\s*([A-Za-z0-9_\-]+)\]", re.IGNORECASE)
+
+
+def _has_row_id_evidence(text: str, notes: str, expected_prefix: str = "") -> bool:
+    """True iff text or notes contains a [ROW_ID=PREFIX-N] marker
+    (optionally narrowing to a specific prefix). The marker is the extractor's
+    own breadcrumb left by read_docx_blocks(); its presence is reliable
+    evidence that this id genuinely came from a structured table."""
+    if not text and not notes:
+        return False
+    combined = f"{text or ''} {notes or ''}"
+    for m in _ROW_ID_EVIDENCE_RE.finditer(combined):
+        val = m.group(1)
+        if not expected_prefix:
+            return True
+        if expected_prefix.upper() in val.upper():
+            return True
+    return False
 
 
 def _is_placeholder(x: Any) -> bool:
@@ -663,34 +746,96 @@ def auto_status(item_type: str, mlevel: str, redflags: List[str]) -> str:
     return "NEW"
 
 
-def ensure_req_id(r: Dict[str, Any], file_name: str, chunk: int) -> str:
-    """
-    Returns new_req_id.
+def ensure_req_id(
+    r: Dict[str, Any],
+    file_name: str,
+    chunk: int,
+    doc_schema: Optional[Dict[str, Any]] = None,
+) -> Tuple[str, str, str]:
+    """Resolve the final req_id with Phase 4 grounding validation.
 
-    Format:
-      RFQ table row : RFQ-{PREFIX}-{num:03d}  e.g. RFQ-BMC-001, RFQ-HOST-030
-      AI extracted  : AI-{seq:03d}             e.g. AI-001, AI-042
+    Returns (req_id, id_source, original_id) where id_source is:
+      - "original"  : id is backed by a trusted structured source
+                      (doc_schema.req_id_rule is structured) OR by a
+                      [ROW_ID=...] evidence marker in the chunk text.
+      - "generated" : no trustworthy id; fresh AI-<NNN>.
+
+    Output formats:
+      - RFQ-<PREFIX>-<NNN>  : trusted PREFIX-N table-row id  (IBM, ...)
+      - RFQ-<NNN>           : trusted numeric raw id from a structured source
+                              (Nokia simple_list xlsx ID column)
+      - RFQ-TBL-<NNN>       : trusted ROW_ID=N marker
+      - AI-<NNN>            : system-generated; covers LLM-hallucinated RFQ-*
+                              (HPE), unknown raw ids, and AUTO-* placeholders.
+
+    Special inputs:
+      __id_locked__=True  — outer split-pipe call already resolved this id;
+                            preserve to avoid re-validating slice text.
     """
+    # Pre-locked from outer split-pipe recursion: short-circuit
+    if r.get("__id_locked__"):
+        return (
+            str(r.get("req_id", "")),
+            str(r.get("__id_source__", "generated")),
+            str(r.get("__id_original__", r.get("req_id", ""))),
+        )
+
+    if doc_schema is None:
+        doc_schema = {}
+
     rid = r.get("req_id")
     rid_str = str(rid).strip() if rid is not None else ""
+    original_id = rid_str
+    text = r.get("requirement", "")
+    notes = r.get("notes", "")
 
-    # Case 1: original RFQ table ID (HOST-30, BMC-1, ROW_ID=2...)
+    file_rule = _file_req_id_rule(doc_schema, file_name)
+    is_structured = _is_structured_req_id_rule(file_rule)
+
+    # Case 1: raw RFQ table id  (HOST-30 / BMC-1 / ROW_ID=2)
     if rid_str and _is_rfq_table_id(rid_str):
         m = re.match(r"^([A-Za-z_]+)-(\d+)$", rid_str)
         if m:
-            return f"RFQ-{m.group(1).upper()}-{int(m.group(2)):03d}"
+            prefix, num = m.group(1), m.group(2)
+            if is_structured or _has_row_id_evidence(text, notes, prefix):
+                return (f"RFQ-{prefix.upper()}-{int(num):03d}", "original", original_id)
+            return (_next_ai_id(), "generated", original_id)
         m2 = re.match(r"^ROW_ID=(\d+)$", rid_str)
         if m2:
-            return f"RFQ-TBL-{int(m2.group(1)):03d}"
-        return f"RFQ-{rid_str}"
+            if is_structured or _has_row_id_evidence(text, notes, ""):
+                return (f"RFQ-TBL-{int(m2.group(1)):03d}", "original", original_id)
+            return (_next_ai_id(), "generated", original_id)
+        if is_structured:
+            return (f"RFQ-{rid_str}", "original", original_id)
+        return (_next_ai_id(), "generated", original_id)
 
-    # Case 2: already clean new-format ID — keep it
-    if rid_str.startswith("RFQ-") or re.match(r'^AI-\d{3}', rid_str):
-        return rid_str
+    # Case 2a: pre-formatted RFQ-PREFIX-NNN  (letter-prefix form, with optional suffix)
+    if rid_str.startswith("RFQ-"):
+        m_letter = re.match(r"^RFQ-([A-Za-z_]+)-\d+(?:-[a-z0-9]+)?$", rid_str)
+        if m_letter:
+            prefix = m_letter.group(1)
+            if is_structured or _has_row_id_evidence(text, notes, prefix):
+                return (rid_str, "original", original_id)
+            return (_next_ai_id(), "generated", original_id)
+        # Numeric form RFQ-NNN  (with optional suffix) — only valid if structured
+        m_num = re.match(r"^RFQ-\d+(?:-[a-z0-9]+)?$", rid_str)
+        if m_num:
+            if is_structured:
+                return (rid_str, "original", original_id)
+            return (_next_ai_id(), "generated", original_id)
+        # Unparseable RFQ-* — preserve cautiously
+        return (rid_str, "original", original_id)
 
-    # Case 3: everything else (AUTO-*, old AI-1-001, empty, unknown) → new AI-XXX
-    _AI_SEQ["n"] += 1
-    return f"AI-{_AI_SEQ['n']:03d}"
+    # Case 2b: existing AI-NNN[-suffix]  →  keep as generated
+    if re.match(r"^AI-\d+(?:-[a-z0-9]+)?$", rid_str):
+        return (rid_str, "generated", original_id)
+
+    # Case 2.5: structured numeric raw id  (Nokia simple_list xlsx ID column: "1" → RFQ-001)
+    if rid_str and is_structured and rid_str.isdigit():
+        return (f"RFQ-{int(rid_str):03d}", "original", original_id)
+
+    # Case 3: AUTO-* / empty / unknown / unstructured-non-PREFIX → fresh AI-<NNN>
+    return (_next_ai_id(), "generated", original_id)
 
 
 def is_enriched_item(r: Dict[str, Any]) -> bool:
@@ -711,8 +856,10 @@ def flatten_redflags(r: Dict[str, Any]) -> List[str]:
     return tags
 
 
-def build_rows(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def build_rows(items: List[Dict[str, Any]], doc_schema: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
+    if doc_schema is None:
+        doc_schema = {}
 
     for r in items:
         src = r.get("source", {}) or {}
@@ -726,14 +873,21 @@ def build_rows(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         # Split pipe rows
         parts = split_pipe_requirement(text)
         if len(parts) > 1:
-            base_id = ensure_req_id(r, f, c)
+            # Resolve once for the parent row; recursion sees __id_locked__
+            # and skips re-validation against the (smaller) slice text.
+            base_id, base_id_src, base_orig = ensure_req_id(
+                r, f, c, doc_schema=doc_schema
+            )
             for idx, p in enumerate(parts):
                 rr = dict(r)
                 rr["requirement"] = p
                 suffix = chr(ord("a") + idx) if idx < 26 else str(idx + 1)
                 rr["req_id"] = f"{base_id}-{suffix}"
+                rr["__id_locked__"]   = True
+                rr["__id_source__"]   = base_id_src
+                rr["__id_original__"] = (f"{base_orig}-{suffix}" if base_orig else rr["req_id"])
                 rr["notes"] = (notes + " | SPLIT_FROM_PIPE").strip(" |")
-                rows.extend(build_rows([rr]))
+                rows.extend(build_rows([rr], doc_schema=doc_schema))
             continue
 
         is_derived = bool(r.get("derived_requirement"))
@@ -804,7 +958,9 @@ def build_rows(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         evidence = clean_llm_text(evidence)
         next_action = clean_llm_text(next_action)
 
-        rid = ensure_req_id(r, f, c)
+        rid, id_source, original_id = ensure_req_id(
+            r, f, c, doc_schema=doc_schema
+        )
         sheet = src.get("sheet", "")
         row = src.get("row")
         fname = re.sub(r'\.(docx|doc|xlsx|xls|pdf|txt|md)$', '', Path(f).name, flags=re.IGNORECASE)
@@ -848,6 +1004,8 @@ def build_rows(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "_orig_req_id": r.get("req_id", ""),
             "_type": item_type,
             "_derived": is_derived,
+            "_id_source": id_source,
+            "_original_id": original_id,
         })
 
     return rows
@@ -880,8 +1038,16 @@ def main():
     reqs = filter_junk(reqs)
     print(f"[POSTPROCESS] After cleaning: {len(reqs)} requirements")
 
+    # Phase 4: load doc_schema so ensure_req_id can validate RFQ-* claims.
+    # When missing/unreadable an empty dict is returned — every RFQ-* claim
+    # then defaults to "untrusted" and is demoted to AI-<NNN>.
+    doc_schema = load_doc_schema(in_path)
+    _ds_rule = (doc_schema or {}).get("req_id_rule", "")
+    _ds_files = len((doc_schema or {}).get("files") or [])
+    print(f"[POSTPROCESS] doc_schema loaded: req_id_rule={_ds_rule!r} files={_ds_files}")
+
     _reset_ai_seq()
-    rows = build_rows(reqs)
+    rows = build_rows(reqs, doc_schema=doc_schema)
 
     cols = [
         "Req ID", "重要程度 (Must Level)", "Category", "Owner", "Stakeholder", "Status",
@@ -978,13 +1144,15 @@ def main():
         "items": []
     }
 
-    _export_cols = [c for c in cols + ["_type", "_orig_req_id", "_derived"] if c in df.columns]
+    _export_cols = [c for c in cols + ["_type", "_orig_req_id", "_derived", "_id_source", "_original_id"] if c in df.columns]
     for r in df.reindex(columns=_export_cols, fill_value="").to_dict(orient="records"):
         _rf_raw = r.get("Risk Flags / 風險標記") or ""
         _rf_list = [t.strip() for t in _rf_raw.split(",") if t.strip()] if _rf_raw else []
         clean["items"].append({
             "req_id":        r["Req ID"],
             "orig_req_id":   r.get("_orig_req_id", ""),
+            "original_id":   r.get("_original_id", ""),
+            "id_source":     r.get("_id_source", "unknown"),
             "type":          r.get("_type", ""),
             "must_level":    r.get("重要程度 (Must Level)", ""),
             "category":      r.get("Category", ""),
