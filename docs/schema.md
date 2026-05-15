@@ -351,3 +351,32 @@ When `items` is empty after filtering `AUTO_SKIP`:
   without explicit shall/must requirements.
   You can still download the empty templates from Step 3 above.
 ```
+
+---
+
+## Phase 4.6 — Optional Normalization Fields
+
+Added by `scripts/normalize_requirements_llm.py` (Phase 4.6A prototype).
+These fields are populated only when the normalization script is run for a
+case; they exist as empty defaults on every `items[]` entry produced by
+`postprocess_requirements.py` so the JSON schema stays uniform.
+
+| Field | Type | Required | Description | Values |
+|-------|------|----------|-------------|--------|
+| `normalized_requirement` | string | Y | LLM-rewritten standalone form of the requirement, with the same constraints (no new numbers/units/standards beyond original + notes + source). Empty when no rewrite was needed or attempted. | — |
+| `rewrite_reason` | string | Y | Why the normalization produced what it did. | `""` (empty = never run) · `already_complete` · `fragment_to_standalone` · `qa_answer_to_requirement` · `ambiguous_needs_review` · `no_rewrite` · `not_attempted` |
+| `rewrite_confidence` | float | Y | LLM-reported confidence, then optionally capped at 0.5 by the lexical audit if hallucinated tokens were detected. | `0.0`–`1.0` |
+| `needs_rewrite_review` | boolean | Y | True when PM should manually verify the normalized text. Set when the LLM self-reports ambiguity, the audit detects new tokens, or the call failed. | `true` / `false` |
+
+**Hard invariants (the script asserts these):**
+- `requirement` (the Original text) is never modified.
+- `req_id` is never changed.
+- `responses.json` is never touched.
+- The script is idempotent: rows with `rewrite_reason` set to anything other
+  than `""` or `"not_attempted"` are skipped unless `--force`.
+
+**Audit guard.** If the normalized text contains numbers, units, version
+codes, model codes, or standards (e.g., `16GB`, `DDR5`, `PCIe 4.0`, `FCC`,
+`TPM 2.0`) that are not present in the original / notes / source pool, the
+script forces `needs_rewrite_review=true` and caps `rewrite_confidence` at
+`0.5`. The original requirement remains the authoritative reference.

@@ -1166,6 +1166,13 @@ def main():
             "next_action":   r.get("Next Action", ""),
             "source":        r.get("Source", ""),
             "derived":       bool(r.get("_derived", False)),
+            # ── Phase 4.6 normalization fields (filled by
+            # scripts/normalize_requirements_llm.py; empty defaults keep the
+            # clean.json schema consistent across all cases). ──
+            "normalized_requirement": "",
+            "rewrite_reason":         "",
+            "rewrite_confidence":     0.0,
+            "needs_rewrite_review":   False,
         })
 
     clean_path = out_dir / "requirements_clean.json"
