@@ -380,3 +380,83 @@ codes, model codes, or standards (e.g., `16GB`, `DDR5`, `PCIe 4.0`, `FCC`,
 `TPM 2.0`) that are not present in the original / notes / source pool, the
 script forces `needs_rewrite_review=true` and caps `rewrite_confidence` at
 `0.5`. The original requirement remains the authoritative reference.
+
+---
+
+## Phase 4.6E — PM Final Requirement & Exclude
+
+### responses.json — three new fields (Phase 4.6E.1)
+
+PM edits captured in Step 4: Review & Fill are persisted into
+`responses/<case>/responses.json` keyed by `req_id`. Phase 4.6E.1 added three
+new fields alongside the existing `status` / `vendor_comment` / `evidence` /
+`gap` / `ai_draft` / `updated_at`:
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `final_requirement` | string | `""` | PM-edited final wording. Empty means PM has not overridden, so the export's "Requirement (Final)" column falls through to `normalized_requirement` or the original `requirement`. |
+| `exclude_from_matrix` | bool | `false` | True = PM has decided this row should NOT appear in the customer-facing Compliance Matrix. Routes the row into the Excluded sheet instead. |
+| `exclude_reason` | string | `""` | Free-text reason for the exclusion. Always saved (so toggling Exclude off and back on restores the reason). Surfaces in the Excluded sheet's "Gap / Notes" column. |
+
+The Step 4 UI shows a `[EXCLUDED]` tag on the expander label when
+`exclude_from_matrix` is true, and the Status filter dropdown includes an
+"Excluded" option that lists only PM-excluded rows.
+
+### compliance_matrix.xlsx — Requirement (Final) column + Excluded sheet (Phase 4.6E.2)
+
+#### HEADERS — 16 → 17 columns
+
+A new **"Requirement (Final)"** column is inserted at position 7, between
+"Compliance Status" and "Requirement (Original)". The fallback chain that
+populates it is:
+
+1. `responses[req_id].final_requirement` (non-empty after `.strip()`) → use PM edit
+2. `item.normalized_requirement` (non-empty) → use LLM-normalized text
+3. `item.requirement` → use the original extraction
+
+The Original column is never mutated — it remains the source of truth.
+
+#### New "Excluded" sheet
+
+Placed after `Skipped` (position 12 overall). Schema is **uniform with every
+other data sheet** (17 columns). The `exclude_reason` is **not** a separate
+column; instead it is prefixed onto the Gap / Notes column for rows in this
+sheet:
+
+- With reason: `[EXCLUDED: <reason>] <original gap text>`
+- Without reason: `[EXCLUDED]`
+
+The prefix is applied once during response merge (re-running export reads
+fresh values from responses.json, so the tag does not accumulate).
+
+#### Routing precedence in `split_sheets()`
+
+PM exclude beats all other routing — even if a row would otherwise have been
+classified as glossary / note / junk / AUTO_SKIP, an explicit
+`exclude_from_matrix=true` sends it to the Excluded sheet:
+
+```
+0. exclude_from_matrix == true → Excluded   ← Phase 4.6E.2
+1. type == "glossary" OR risk_tags ⊇ {GLOSSARY} → Glossary
+2. type == "note"                              → Notes
+3. type == "junk" OR status == "AUTO_SKIP"     → Skipped
+4. (everything else)                            → Compliance Matrix (main)
+```
+
+#### Row-count invariants
+
+- `Compliance Matrix rows == Σ(3. Hardware ... 8. Others rows)` — both
+  derived from `main_reqs` which has PM-excluded items already removed.
+- `By_Category_Summary` Total row equals `Compliance Matrix rows` — Summary
+  is built from the same `main_reqs` and therefore does NOT count excluded.
+- `Excluded sheet rows == count(responses where exclude_from_matrix=true)` —
+  the Excluded sheet is a 1:1 reflection of PM decisions.
+
+#### Backward compatibility
+
+- Old `responses.json` files without these fields: all three default to
+  empty / false, so behaviour is unchanged.
+- Cases that have never run Step 3.5 Normalize: `normalized_requirement` is
+  empty, so "Requirement (Final)" falls through to Original.
+- Excluded sheet is present even when empty (header row only), so the
+  workbook schema is consistent across cases.

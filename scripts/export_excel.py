@@ -29,6 +29,8 @@ HEADERS = [
     "Responsible Team",
     "Stakeholder",
     "Compliance Status",
+    # ── Phase 4.6E.2: PM final wording (fallback: PM edit → normalized → original) ──
+    "Requirement (Final)",
     "Requirement (Original)",
     # ── Phase 4.6 normalization output (filled by normalize_requirements_llm.py)
     "Requirement (Normalized)",
@@ -362,10 +364,12 @@ def _load_reqs(data: Dict[str, Any]) -> List[Dict[str, Any]]:
     return out
 
 
-def split_sheets(reqs: List[Dict[str, Any]]) -> Tuple[List, List, List, List]:
-    """Route items into 4 buckets — main / glossary / notes / skipped.
+def split_sheets(reqs: List[Dict[str, Any]]) -> Tuple[List, List, List, List, List]:
+    """Route items into 5 buckets — main / glossary / notes / skipped / pm_excluded.
 
     Routing precedence (first match wins):
+      0. PM Excluded — exclude_from_matrix is True (Phase 4.6E.2; PM-explicit
+                       decision wins over every type-based routing below)
       1. Glossary   — type == "glossary"  OR  risk_tags contains "GLOSSARY"
       2. Notes      — type == "note"
       3. Skipped    — type == "junk"  OR  status == "AUTO_SKIP"
@@ -375,8 +379,13 @@ def split_sheets(reqs: List[Dict[str, Any]]) -> Tuple[List, List, List, List]:
                        mis-tagged.)
       4. Main       — everything else (real requirements)
     """
-    main, glossary, notes, skipped = [], [], [], []
+    main, glossary, notes, skipped, pm_excluded = [], [], [], [], []
     for r in reqs:
+        # Phase 4.6E.2 — PM explicit exclude takes highest priority
+        if r.get("exclude_from_matrix") is True:
+            pm_excluded.append(r)
+            continue
+
         req_type = str(r.get("type") or "").lower()
         status   = str(r.get("status") or "").upper()
         raw_tags = r.get("risk_tags") or []
@@ -395,7 +404,7 @@ def split_sheets(reqs: List[Dict[str, Any]]) -> Tuple[List, List, List, List]:
             continue
         main.append(r)
 
-    return main, glossary, notes, skipped
+    return main, glossary, notes, skipped, pm_excluded
 
 
 def apply_sheet_style(ws) -> None:
@@ -417,6 +426,7 @@ def apply_sheet_style(ws) -> None:
     ws.freeze_panes = "A2"
 
     wrap_cols = {
+        "Requirement (Final)",
         "Requirement (Original)",
         "Requirement (Normalized)",
         "Stakeholder",
@@ -443,6 +453,7 @@ def apply_sheet_style(ws) -> None:
         "Responsible Team": 14,
         "Stakeholder": 22,
         "Compliance Status": 18,
+        "Requirement (Final)": 60,
         "Requirement (Original)": 60,
         "Requirement (Normalized)": 60,
         "Rewrite Reason": 24,
@@ -559,8 +570,19 @@ def write_sheet(ws, reqs: List[Dict[str, Any]]) -> None:
             conf_str = ""
         review_str = "REVIEW" if needs_review else ""
 
+        # ── Phase 4.6E.2: Requirement (Final) fallback chain ──
+        #     PM edit  →  LLM normalized  →  Original
+        _pm_final = (r.get("final_requirement") or "").strip()
+        if _pm_final:
+            final_req = _pm_final
+        elif normalized:
+            final_req = normalized
+        else:
+            final_req = req_text
+
         ws.append([
             req_id, must_level, category, owner, stakeholder, status,
+            final_req,                                   # ← Phase 4.6E.2 col 7
             req_text,
             normalized, rewrite_reason, conf_str, review_str,
             risk_str,
@@ -582,6 +604,41 @@ def write_sheet(ws, reqs: List[Dict[str, Any]]) -> None:
             cell.font = Font(name="Arial", size=10, color="0C447C")
 
 
+def _merge_responses(reqs: List[Dict[str, Any]], responses: Dict[str, Any]) -> None:
+    """Apply PM responses onto items in-place (Phase 4.6E.2).
+
+    Runs BEFORE split_sheets so that `exclude_from_matrix=True` can drive
+    routing into the dedicated 'Excluded' sheet. Items without a matching
+    response entry are untouched.
+
+    For excluded rows, the Gap / Notes column is prefixed with
+    "[EXCLUDED: <reason>]" (or "[EXCLUDED]" if no reason was given) so the
+    Excluded sheet can show the reason without a separate column.
+    """
+    for r in reqs:
+        resp = responses.get(r.get("req_id", ""), {})
+        if not resp:
+            continue
+        if resp.get("status"):           r["status"]            = resp["status"]
+        if resp.get("vendor_comment"):   r["vendor_comment"]    = resp["vendor_comment"]
+        if resp.get("gap"):              r["gap"]               = resp["gap"]
+        if resp.get("ai_draft"):         r["ai_draft"]          = resp["ai_draft"]
+        # Phase 4.6E.2 — three new fields
+        if resp.get("final_requirement"):
+            r["final_requirement"] = resp["final_requirement"]
+        r["exclude_from_matrix"] = bool(resp.get("exclude_from_matrix", False))
+        r["exclude_reason"]      = str(resp.get("exclude_reason", "") or "")
+
+    # Prefix [EXCLUDED] tag to Gap / Notes for excluded rows. Done in a second
+    # pass so the source `r["gap"]` is the freshly-merged value, not stale.
+    for r in reqs:
+        if r.get("exclude_from_matrix") is True:
+            reason = (r.get("exclude_reason") or "").strip()
+            tag    = f"[EXCLUDED: {reason}]" if reason else "[EXCLUDED]"
+            gap    = (r.get("gap") or "").strip()
+            r["gap"] = f"{tag} {gap}" if gap else tag
+
+
 def export_excel(data: Dict[str, Any], out_xlsx: Path, responses_path: Optional[Path] = None) -> None:
     # Load responses.json (owner-filled data)
     responses: Dict[str, Any] = {}
@@ -596,21 +653,11 @@ def export_excel(data: Dict[str, Any], out_xlsx: Path, responses_path: Optional[
     wb.remove(wb.active)
 
     reqs = _load_reqs(data)
-    main_reqs, glossary_reqs, notes_reqs, skipped_reqs = split_sheets(reqs)
-
-    # Merge owner responses into main_reqs
-    for r in main_reqs:
-        rid = r.get("req_id", "")
-        resp = responses.get(rid, {})
-        if resp:
-            if resp.get("status"):
-                r["status"] = resp["status"]
-            if resp.get("vendor_comment"):
-                r["vendor_comment"] = resp["vendor_comment"]
-            if resp.get("gap"):
-                r["gap"] = resp["gap"]
-            if resp.get("ai_draft"):
-                r["ai_draft"] = resp["ai_draft"]
+    # Phase 4.6E.2: merge responses BEFORE split so exclude_from_matrix routes
+    # rows into the dedicated Excluded sheet (replaces the legacy post-split
+    # merge that only touched main_reqs).
+    _merge_responses(reqs, responses)
+    main_reqs, glossary_reqs, notes_reqs, skipped_reqs, pm_excluded_reqs = split_sheets(reqs)
 
     # ── PM 排序：NEED_REVIEW 先 > 有 Redflag 先 > MUST 先 > Category ──────────
     _status_order = {"NEED_REVIEW": 0, "INTERNAL_ALIGN": 1, "ASK_CUSTOMER": 2,
@@ -649,6 +696,8 @@ def export_excel(data: Dict[str, Any], out_xlsx: Path, responses_path: Optional[
     write_sheet(wb.create_sheet("Glossary"), glossary_reqs)
     write_sheet(wb.create_sheet("Notes"),    notes_reqs)
     write_sheet(wb.create_sheet("Skipped"),  skipped_reqs)
+    # Phase 4.6E.2 — PM-excluded sheet (placed after Skipped)
+    write_sheet(wb.create_sheet("Excluded"), pm_excluded_reqs)
 
     out_xlsx.parent.mkdir(parents=True, exist_ok=True)
     wb.save(out_xlsx)
@@ -705,7 +754,7 @@ def main():
     print("[OK] Sheets: Compliance Matrix, By_Category_Summary, "
           "3. Hardware, 4. Software, 5. Mechanical, "
           "6. Regulatory, 7. Environmental, 8. Others, "
-          "Glossary, Notes, Skipped")
+          "Glossary, Notes, Skipped, Excluded")
 
 
 if __name__ == "__main__":
