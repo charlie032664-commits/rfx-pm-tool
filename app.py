@@ -638,8 +638,9 @@ if mode == "Select Existing Case" and rfq_dir.exists():
             column_config={
                 "Include":    st.column_config.CheckboxColumn(
                     "Include", default=True,
-                    help="Mark whether this file should feed the pipeline "
-                         "(advisory only in Phase 3 — does not yet skip files)",
+                    help="Mark whether this file should feed the pipeline. "
+                         "Files with Include=False are skipped by extraction "
+                         "and excluded from manifest.json (Phase 7).",
                 ),
                 "File":       st.column_config.TextColumn("File",       disabled=True),
                 "Type":       st.column_config.TextColumn("Type",       disabled=True, width="small"),
@@ -883,7 +884,7 @@ if mode == "Select Existing Case":
     else:
         st.info("\U0001f4a1 \u5c1a\u672a\u5206\u6790\u6587\u4ef6\u683c\u5f0f\uff0cRun Full Pipeline \u6642\u6703\u81ea\u52d5\u5206\u6790\u4e26\u5132\u5b58\u81f3 meta/doc_schema.json")
 
-    # ── Step 1.5 advisory: warn if PM marked files excluded (not yet enforced) ──
+    # ── Step 1.5 enforcement notice: list files the extractor will skip ──
     _selection_data = load_file_selection(selected_case)
     _excluded_files = [
         _name for _name, _info in (_selection_data.get("selections") or {}).items()
@@ -894,9 +895,8 @@ if mode == "Select Existing Case":
         if len(_excluded_files) > 3:
             _shown += f", … (+{len(_excluded_files) - 3} more)"
         st.info(
-            f"ℹ️ **{len(_excluded_files)} file(s) marked excluded in Step 1.5**: {_shown}  \n"
-            "First version is **advisory only** — the pipeline will still process "
-            "all files in `rfq/`. (Phase 7 will enforce skipping.)"
+            f"ℹ️ **{len(_excluded_files)} file(s) will be skipped by extraction**: {_shown}  \n"
+            "To process them, re-enable in **Step 1.5** above and click **Save Selection**."
         )
 
     # ── Pipeline lock state (computed BEFORE buttons so we can gate them) ──

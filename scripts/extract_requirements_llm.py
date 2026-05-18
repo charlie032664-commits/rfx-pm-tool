@@ -37,6 +37,7 @@ sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 from llm_client import get_client, get_model, is_available, parse_json_response
+from file_selection import load_excluded   # Phase 7: enforce Step 1.5 exclusion
 
 try:
     import docx  # python-docx
@@ -1281,11 +1282,29 @@ def main():
         partial_path.unlink()
         print(f"[OK] Deleted partial: {partial_path}")
 
+    # Phase 7: load Step 1.5 exclusion set early so we can also scrub any stale
+    # partial.jsonl entries that were written before the file was excluded.
+    excluded_files = load_excluded(case_dir)
+    if excluded_files:
+        print(f"[INFO] Step 1.5: {len(excluded_files)} file(s) marked excluded: "
+              f"{sorted(excluded_files)}")
+
     done_keys: Set[Tuple[str, int]] = set()
     all_reqs: List[Dict[str, Any]] = []
 
     if args.resume and partial_path.exists():
         done_keys, partial_reqs = load_done_keys(partial_path)
+        if excluded_files:
+            _orig_partial = len(partial_reqs)
+            partial_reqs = [
+                r for r in partial_reqs
+                if str((r.get("source") or {}).get("file", "")) not in excluded_files
+            ]
+            done_keys = {k for k in done_keys if k[0] not in excluded_files}
+            _dropped_partial = _orig_partial - len(partial_reqs)
+            if _dropped_partial > 0:
+                print(f"[INFO] Step 1.5: dropped {_dropped_partial} stale partial req(s) "
+                      "from now-excluded file(s)")
         all_reqs.extend(partial_reqs)
         print(f"[OK] Resume enabled. Loaded done chunks: {len(done_keys)}; partial reqs: {len(partial_reqs)}")
 
@@ -1329,6 +1348,19 @@ def main():
         files.extend(sorted(rfq_dir.glob(ext)))
     if not files:
         raise FileNotFoundError(f"No supported files found in: {rfq_dir} (docx/doc/xlsx/xls/pdf/md/txt)")
+
+    # Phase 7: filter out files the PM marked Include=False in Step 1.5
+    if excluded_files:
+        _dropped_files = [fp.name for fp in files if fp.name in excluded_files]
+        files = [fp for fp in files if fp.name not in excluded_files]
+        if _dropped_files:
+            print(f"[INFO] Step 1.5: skipping {len(_dropped_files)} excluded file(s): {_dropped_files}")
+        if not files:
+            raise FileNotFoundError(
+                f"All input files in {rfq_dir} were marked Include=False in Step 1.5. "
+                f"Re-enable some files via the UI (Step 1.5 → Save Selection) or "
+                f"edit inbound/<case>/meta/file_selection.json directly."
+            )
 
     for fp in files:
         name = fp.name
