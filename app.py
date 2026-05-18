@@ -1509,7 +1509,8 @@ else:
     f1, f2, f3 = st.columns(3)
     all_cats   = sorted(set(str(i.get("category", "")) for i in items))
     all_owners = sorted(set(str(i.get("owner", "")) for i in items))
-    status_opts = ["All", "NEED_REVIEW", "NEW", "PENDING", "COMPLIANT", "PARTIAL", "NON-COMPLIANT"]
+    # Phase 4.6E.1: "Excluded" filter shows rows PM marked exclude_from_matrix=True
+    status_opts = ["All", "NEED_REVIEW", "NEW", "PENDING", "COMPLIANT", "PARTIAL", "NON-COMPLIANT", "Excluded"]
 
     filter_status = f1.selectbox("Status",   status_opts,             key="rv_status")
     filter_cat    = f2.selectbox("Category", ["All"] + all_cats,      key="rv_cat")
@@ -1519,9 +1520,16 @@ else:
     filtered = []
     for item in items:
         rid = item.get("req_id", "")
-        cur_status = responses.get(rid, {}).get("status") or item.get("status", "NEW")
-        if filter_status != "All" and cur_status != filter_status:
-            continue
+        _cur_resp = responses.get(rid, {})
+        cur_status = _cur_resp.get("status") or item.get("status", "NEW")
+        _is_pm_excluded = _cur_resp.get("exclude_from_matrix") is True
+        # Phase 4.6E.1: "Excluded" filter — only show PM-excluded rows
+        if filter_status == "Excluded":
+            if not _is_pm_excluded:
+                continue
+        elif filter_status != "All":
+            if cur_status != filter_status:
+                continue
         if filter_cat != "All" and str(item.get("category", "")) != filter_cat:
             continue
         if filter_owner != "All" and str(item.get("owner", "")) != filter_owner:
@@ -1541,13 +1549,42 @@ else:
             cat = ", ".join(cat)
         _is_derived = item.get("derived", False)
         _derived_tag = " [DERIVED]" if _is_derived else ""
-        label = f"{rid} | {cat} | {cur_status}{_derived_tag}"
+        # Phase 4.6E.1: tag rows PM marked exclude_from_matrix=True
+        _is_pm_excluded = cur.get("exclude_from_matrix") is True
+        _excluded_tag = " [EXCLUDED]" if _is_pm_excluded else ""
+        label = f"{rid} | {cat} | {cur_status}{_derived_tag}{_excluded_tag}"
 
         with st.expander(label):
             if _is_derived:
                 st.caption("Derived from spec table — not an explicit customer requirement. Confirm against design.")
-            st.markdown(f"**Requirement:** {item.get('requirement', '')}")
 
+            # ── Requirement (Original) — never mutated ──
+            st.markdown(f"**Requirement (Original):** {item.get('requirement', '')}")
+
+            # ── Phase 4.6E.1: read-only Normalized display (when present) ──
+            _norm_text = (item.get("normalized_requirement") or "").strip()
+            _rewrite_reason = (item.get("rewrite_reason") or "").strip()
+            if _norm_text:
+                st.markdown(f"**Requirement (Normalized):** {_norm_text}")
+                try:
+                    _conf_str = f"{float(item.get('rewrite_confidence') or 0):.2f}"
+                except (TypeError, ValueError):
+                    _conf_str = "—"
+                _info_bits = []
+                if _rewrite_reason:
+                    _info_bits.append(f"Rewrite Reason: `{_rewrite_reason}`")
+                _info_bits.append(f"Confidence: `{_conf_str}`")
+                st.caption(" · ".join(_info_bits))
+                if bool(item.get("needs_rewrite_review", False)):
+                    st.warning(
+                        "⚠️ **REVIEW** — Normalized text may contain hallucinated "
+                        "tokens not present in the Original. Compare carefully "
+                        "before using."
+                    )
+            elif _rewrite_reason == "already_complete":
+                st.caption("✓ Already complete — Original is a standalone requirement.")
+
+            # ── Context: meta / risk / source / ai_draft (unchanged) ──
             meta_cols = st.columns(3)
             meta_cols[0].caption(f"Owner: {item.get('owner', '')}")
             sh = item.get("stakeholder") or []
@@ -1574,6 +1611,52 @@ else:
             if ai_draft:
                 st.caption(f"AI Draft: {ai_draft}")
 
+            # ── Phase 4.6E.1: PM Final Requirement (editable, fallback chain) ──
+            # Default value:  PM edit (responses.final_requirement) →
+            #                 LLM normalized (item.normalized_requirement) →
+            #                 Original (item.requirement)
+            _pm_final_saved = (cur.get("final_requirement") or "").strip()
+            _orig_text = item.get("requirement", "") or ""
+            if _pm_final_saved:
+                _default_final  = _pm_final_saved
+                _default_source = "PM edit"
+            elif _norm_text:
+                _default_final  = _norm_text
+                _default_source = "normalized"
+            else:
+                _default_final  = _orig_text
+                _default_source = "original"
+            new_final = st.text_area(
+                "PM Final Requirement",
+                value=_default_final,
+                key=f"fr_{_key}",
+                help="Text that will appear in the final compliance_matrix.xlsx "
+                     "(Phase 4.6E.2 will wire this into the Excel export). "
+                     "Defaults to Normalized if available, else Original. Edit freely.",
+            )
+            st.caption(f"Default source: **{_default_source}**")
+
+            # ── Phase 4.6E.1: Exclude from final matrix ──
+            _excol1, _excol2 = st.columns([1, 3])
+            new_exclude = _excol1.checkbox(
+                "Exclude from final matrix",
+                value=bool(cur.get("exclude_from_matrix", False)),
+                key=f"ex_{_key}",
+                help="Mark to move this row to the 'Excluded' sheet of "
+                     "compliance_matrix.xlsx (Phase 4.6E.2 — Excel wiring "
+                     "is not yet active in this build).",
+            )
+            new_exclude_reason = _excol2.text_input(
+                "Exclude reason",
+                value=cur.get("exclude_reason", "") or "",
+                disabled=not new_exclude,
+                key=f"er_{_key}",
+                help="Why this row is excluded (free text). Saved to "
+                     "responses.json regardless of toggle state, so re-enabling "
+                     "Exclude restores the previous reason.",
+            )
+
+            # ── Existing edit fields ──
             _status_options = ["PENDING", "NEED_REVIEW", "COMPLIANT", "PARTIAL", "NON-COMPLIANT"]
             _status_idx = _status_options.index(cur_status) if cur_status in _status_options else 0
             new_status   = st.selectbox("Status", _status_options, index=_status_idx, key=f"st_{_key}")
@@ -1587,5 +1670,9 @@ else:
                     vendor_comment=new_comment,
                     evidence=new_evidence,
                     gap=new_gap,
+                    # Phase 4.6E.1 — three new fields:
+                    final_requirement=new_final,
+                    exclude_from_matrix=new_exclude,
+                    exclude_reason=new_exclude_reason,
                 )
                 st.success("Saved.")
