@@ -5,6 +5,7 @@ import re
 import socket
 import subprocess
 import sys
+import time
 import pandas as pd
 import streamlit as st
 import yaml
@@ -207,17 +208,160 @@ def read_progress_counts(case_id: str) -> dict:
     return counts
 
 
-def run_step(cmd: list) -> tuple[int, str]:
-    """Run a subprocess and return (returncode, combined stdout+stderr)."""
-    result = subprocess.run(
+def run_step_streaming(cmd: list, on_line) -> tuple[int, str]:
+    """Run a subprocess and stream stdout to on_line() line by line.
+
+    Returns (returncode, combined_output_stripped). stderr is merged into
+    stdout so [WARN] retry lines arrive in the same event stream as
+    [PROGRESS] lines. PYTHONUNBUFFERED=1 is injected into the child env so
+    Python flushes prints immediately; without it, prints buffer until the
+    child exits and live progress is impossible.
+
+    on_line is called with each non-empty stripped line. Exceptions raised
+    by on_line are swallowed so a UI handler bug cannot crash the loop.
+    """
+    env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+    proc = subprocess.Popen(
         cmd,
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        bufsize=1,
         text=True,
         encoding="utf-8",
         errors="replace",
+        env=env,
     )
-    output = (result.stdout + result.stderr).strip()
-    return result.returncode, output
+    buf: list[str] = []
+    try:
+        for line in iter(proc.stdout.readline, ""):
+            buf.append(line)
+            s = line.rstrip("\r\n")
+            if not s:
+                continue
+            try:
+                on_line(s)
+            except Exception:
+                pass
+    finally:
+        proc.stdout.close()
+        proc.wait()
+    return proc.returncode, "".join(buf).strip()
+
+
+# Phase 4.6F.1 — Progress event parser & widget state for streaming UI
+# See docs/schema.md "Phase 4.6F — Progress log contract" for the line
+# formats this parser recognizes.
+
+_RE_CHUNKS_TOTAL = re.compile(r'^\[INFO\]\s+(\S+):\s+(\d+)\s+chunks\s*$')
+_RE_CHUNK        = re.compile(r'^\[(?:PROGRESS|SKIP)\]\s+(\S+)\s+chunk\s+(\d+)/(\d+)\b')
+_RE_ITEM         = re.compile(r'^\s*\[(\d+)/(\d+)\]\s+(\S+)')
+_RE_RETRY        = re.compile(
+    r'^\[WARN\]\s+LLM\s+(?:call failed\s+\(attempt\s+|enrich\s+attempt\s+)'
+    r'(\d+)/(\d+).*?->\s*sleep\s+(\d+(?:\.\d+)?)\s*s'
+)
+
+
+def _parse_progress_line(line: str) -> dict | None:
+    """Parse one stdout line into a progress event dict, or None if it carries
+    no progress info. Lines that don't match any pattern are still appended
+    to the per-step log buffer by run_step_streaming()."""
+    m = _RE_CHUNK.match(line)
+    if m:
+        return {"kind": "chunk", "file": m.group(1),
+                "done": int(m.group(2)), "total": int(m.group(3))}
+    m = _RE_CHUNKS_TOTAL.match(line)
+    if m:
+        return {"kind": "chunks_total", "file": m.group(1),
+                "total": int(m.group(2))}
+    m = _RE_RETRY.match(line)
+    if m:
+        return {"kind": "retry", "attempt": int(m.group(1)),
+                "max": int(m.group(2)), "sleep_s": float(m.group(3))}
+    m = _RE_ITEM.match(line)
+    if m:
+        return {"kind": "item", "done": int(m.group(1)),
+                "total": int(m.group(2)), "req_id": m.group(3)}
+    return None
+
+
+def _make_progress_slots() -> dict:
+    """Build the per-step widget tree inside an st.status() block. Each slot
+    is an st.empty() placeholder; slots that never receive an event stay
+    invisible so e.g. Format/Export steps render only an elapsed line."""
+    return {
+        "file":    st.empty(),
+        "chunk":   st.empty(),
+        "item":    st.empty(),
+        "elapsed": st.empty(),
+        "retry":   st.empty(),
+        "_state": {
+            "file_current": "",
+            "chunk_done":   0,
+            "chunk_total":  0,
+            "item_done":    0,
+            "item_total":   0,
+            "started_at":   0.0,
+        },
+    }
+
+
+def _make_on_line(slots: dict, started_at: float):
+    """Build an on_line callback bound to a step's slot tree + start time."""
+    state = slots["_state"]
+    state["started_at"] = started_at
+
+    def _fmt_eta(done: int, total: int, elapsed: float) -> str:
+        # Require done >= 2 to dampen the wildly misleading first-sample ETA.
+        if done < 2 or total <= 0 or done >= total:
+            return ""
+        remaining = elapsed * (total - done) / done
+        return f"  ·  ETA: ~{int(remaining)}s (rough)"
+
+    def _render_elapsed():
+        elapsed = time.monotonic() - state["started_at"]
+        if state["chunk_total"] > 0:
+            eta = _fmt_eta(state["chunk_done"], state["chunk_total"], elapsed)
+        elif state["item_total"] > 0:
+            eta = _fmt_eta(state["item_done"], state["item_total"], elapsed)
+        else:
+            eta = ""
+        slots["elapsed"].markdown(f"⏱  elapsed: {int(elapsed)}s{eta}")
+
+    def on_line(line: str):
+        ev = _parse_progress_line(line)
+        if ev is None:
+            # Refresh elapsed even for non-progress lines so the timer keeps
+            # ticking during pre-loop work (schema analyze, file parse, etc.)
+            # — otherwise the UI looks frozen while stdout is actually flowing.
+            _render_elapsed()
+            return
+        k = ev["kind"]
+        if k == "chunks_total":
+            state["chunk_total"] = ev["total"]
+            state["file_current"] = ev["file"]
+            slots["file"].markdown(f"📄 file: `{ev['file']}`")
+            slots["chunk"].markdown(f"📦 chunk: 0 / {ev['total']}")
+        elif k == "chunk":
+            state["chunk_done"]  = ev["done"]
+            state["chunk_total"] = ev["total"]
+            if ev["file"] != state["file_current"]:
+                state["file_current"] = ev["file"]
+                slots["file"].markdown(f"📄 file: `{ev['file']}`")
+            slots["chunk"].markdown(f"📦 chunk: {ev['done']} / {ev['total']}")
+        elif k == "item":
+            state["item_done"]  = ev["done"]
+            state["item_total"] = ev["total"]
+            slots["item"].markdown(
+                f"▫ item: {ev['done']} / {ev['total']}  ·  `{ev['req_id']}`"
+            )
+        elif k == "retry":
+            slots["retry"].warning(
+                f"⚠ Last retry: attempt {ev['attempt']}/{ev['max']}"
+                f", sleep {ev['sleep_s']:g}s"
+            )
+        _render_elapsed()
+
+    return on_line
 
 
 def _parse_normalize_summary(output: str) -> dict:
@@ -1081,12 +1225,27 @@ if mode == "Select Existing Case":
                             break
 
                         st.write(f"▶  {label}…")
-                        rc, output = run_step(step["cmd"])
+                        _slots = _make_progress_slots()
+                        _t0 = time.monotonic()
+                        _slots["elapsed"].markdown("⏱  elapsed: 0s  (running…)")
+                        rc, output = run_step_streaming(
+                            step["cmd"], _make_on_line(_slots, _t0)
+                        )
+                        _elapsed_final = int(time.monotonic() - _t0)
+                        _slots["elapsed"].markdown(
+                            f"⏱  elapsed: {_elapsed_final}s"
+                        )
 
                         if rc == 0:
-                            st.write(f"✅  {label} — {step['ok_msg']}")
+                            st.write(
+                                f"✅  {label} — {step['ok_msg']}  "
+                                f"({_elapsed_final}s)"
+                            )
                         else:
-                            st.write(f"❌  {label} failed (exit code {rc})")
+                            st.write(
+                                f"❌  {label} failed (exit code {rc})  "
+                                f"({_elapsed_final}s)"
+                            )
 
                         st.session_state.pipeline_step_results.append(
                             {"ok": rc == 0, "label": label, "ok_msg": step["ok_msg"], "rc": rc, "output": output}
@@ -1400,11 +1559,25 @@ if mode == "Select Existing Case":
                         for _step in _NORMALIZE_STEPS:
                             _lbl = _step["label"]
                             st.write(f"▶  {_lbl}…")
-                            _rc, _out = run_step(_step["cmd"])
+                            _slots = _make_progress_slots()
+                            _t0 = time.monotonic()
+                            _slots["elapsed"].markdown(
+                                "⏱  elapsed: 0s  (running…)"
+                            )
+                            _rc, _out = run_step_streaming(
+                                _step["cmd"], _make_on_line(_slots, _t0)
+                            )
+                            _elapsed_final = int(time.monotonic() - _t0)
+                            _slots["elapsed"].markdown(
+                                f"⏱  elapsed: {_elapsed_final}s"
+                            )
                             if _rc == 0:
-                                st.write(f"✅  {_lbl}")
+                                st.write(f"✅  {_lbl}  ({_elapsed_final}s)")
                             else:
-                                st.write(f"❌  {_lbl} failed (exit code {_rc})")
+                                st.write(
+                                    f"❌  {_lbl} failed (exit code {_rc})  "
+                                    f"({_elapsed_final}s)"
+                                )
                             st.session_state.normalize_step_results.append(
                                 {"ok": _rc == 0, "label": _lbl, "rc": _rc, "output": _out}
                             )

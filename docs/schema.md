@@ -537,3 +537,65 @@ banner as a hint only. Phase 4.6D does not change this.
   written lock files always carry the field.
 - The stale rule is identical, so any operational tooling that checks
   age continues to work.
+
+---
+
+## Phase 4.6F — Progress log contract (UI streaming)
+
+Phase 4.6F.1 introduces live progress widgets in **Step 2** (Full Pipeline
+/ Enrich+Format+Export) and **Step 3.5** (Normalize). The widgets are
+driven by parsing each subprocess's stdout line by line. The format below
+is the contract between the scripts that produce these lines and the UI
+parser in `app.py` (`_parse_progress_line`).
+
+### Recognized event lines
+
+| Line shape | Emitted by | UI effect |
+|---|---|---|
+| `[INFO] <file>: <N> chunks` | `extract_requirements_llm.py` per file | Reset chunk slot to `0 / N`, set current file |
+| `[PROGRESS] <file> chunk <i>/<N>` | `extract_requirements_llm.py` before each chunk's LLM call | Advance chunk slot to `i / N`; recompute ETA |
+| `[SKIP] <file> chunk <i>/<N> already done` | `extract_requirements_llm.py` resume path | Same as `[PROGRESS]` — advances counter |
+| `  [<i>/<N>] <req_id> …` | `normalize_requirements_llm.py` per item | Advance item slot to `i / N · req_id` |
+| `[WARN] LLM call failed (attempt <i>/<N>) … -> sleep <s>s` | `extract_requirements_llm.py` retry | Show retry warning |
+| `[WARN] LLM enrich attempt <i>/<N> … -> sleep <s>s` | `run_case.py` retry (Phase 4.6F.2 will wire visible enrich progress) | Show retry warning |
+
+Any line that doesn't match any pattern is appended to the per-step log
+expander unchanged. A step that emits **no** events still works — the
+UI shows the spinner, an "elapsed: 0s (running…)" placeholder, and the
+full log on completion.
+
+### Buffering
+
+`run_step_streaming()` injects `PYTHONUNBUFFERED=1` into the subprocess
+environment so Python's stdout flushes line by line into the pipe.
+Scripts therefore do **not** need `flush=True` on individual `print()`
+calls; the existing prints stream as-is.
+
+### Stderr
+
+The streaming runner merges `stderr` into `stdout`
+(`stderr=subprocess.STDOUT`), so `[WARN]` retry lines arrive in the same
+event stream and are parsed alongside `[PROGRESS]` lines.
+
+### ETA
+
+ETA is computed as `elapsed × (total − done) / done`. It is shown only
+when `done ≥ 2` and `done < total`, and is labelled "(rough)" — chunk
+sizes are uneven, retry sleeps distort the rate, and the linear
+extrapolation does not model these. Requiring `done ≥ 2` dampens the
+wildly misleading first-sample ETA that a single warm-up call would
+produce.
+
+### Scope of Phase 4.6F.1
+
+**In scope:**
+- Streaming infrastructure (`run_step_streaming`)
+- Extract chunk progress
+- Normalize per-item progress
+- LLM retry warning surface
+
+**Out of scope (deferred to Phase 4.6F.2):**
+- Enrich per-item progress — requires a new `[PROGRESS] enrich i/N …`
+  line in `scripts/run_case.py` (silent today)
+- Cancel / interrupt button
+- Persisted run history / per-run timeline export
