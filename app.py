@@ -308,8 +308,17 @@ def _get_file_role_confidence(doc_schema_info: dict | None, filename: str) -> tu
 # Lock file lives at: runs/<case_id>/.pipeline.lock
 # Stale rule: file age > PIPELINE_LOCK_STALE_HOURS (2h).
 # PID-dead is supplementary info only; it does NOT override the 2h rule.
+#
+# Phase 4.6D — lock files now carry an `operation` field so the UI can
+# tell PM *what kind* of run is holding the lock (pipeline vs normalize).
+# Old lock files without this field still parse fine; they render as
+# "another session" in the UI.
 
 PIPELINE_LOCK_STALE_HOURS = 2
+
+# Phase 4.6D — allowed values for the lock file's `operation` field.
+# Any other value gets normalized to "unknown" by acquire_lock().
+ALLOWED_LOCK_OPERATIONS = {"pipeline", "normalize", "unknown"}
 
 
 def _lock_path(case_id: str) -> Path:
@@ -386,13 +395,26 @@ def is_lock_stale(info: dict | None) -> bool:
     return age > timedelta(hours=PIPELINE_LOCK_STALE_HOURS)
 
 
-def acquire_lock(case_id: str, start_step: int) -> dict | None:
+def acquire_lock(case_id: str, start_step: int,
+                 operation: str = "unknown") -> dict | None:
     """Atomically create the .pipeline.lock for case_id.
 
     If an existing lock is stale/invalid, it is replaced. If an existing
     lock is active, returns None (caller must abort). On success returns
     the freshly-written lock dict.
+
+    Phase 4.6D — `operation` records what kind of run is holding the lock:
+      - "pipeline"  → Full Pipeline / Enrich+Format+Export
+      - "normalize" → Step 3.5 Normalize
+      - "unknown"   → anything else / unset / unrecognized value
+    Unrecognized values are normalized to "unknown" so a typo in a future
+    caller never breaks the schema.
     """
+    # Phase 4.6D — defensively normalize operation
+    op = (operation or "").strip().lower()
+    if op not in ALLOWED_LOCK_OPERATIONS:
+        op = "unknown"
+
     p = _lock_path(case_id)
     p.parent.mkdir(parents=True, exist_ok=True)
 
@@ -413,6 +435,7 @@ def acquire_lock(case_id: str, start_step: int) -> dict | None:
         "host":       socket.gethostname(),
         "user":       getpass.getuser(),
         "start_step": int(start_step),
+        "operation":  op,                       # ← Phase 4.6D
     }
     try:
         # "x" mode = create-exclusive; fails if another writer raced us
@@ -910,12 +933,21 @@ if mode == "Select Existing Case":
         _pid_dead_hint = ""
         if _li.get("host") == socket.gethostname() and _pid_val and not _pid_alive(_pid_val):
             _pid_dead_hint = "  ⚠ PID no longer running on this host"
+        # Phase 4.6D — operation-aware headline so PM sees WHY the case is locked
+        _op = (_li.get("operation") or "").strip().lower()
+        if _op == "pipeline":
+            _hdr = "🔒 **This case is currently locked by a pipeline run.**"
+        elif _op == "normalize":
+            _hdr = "🔒 **This case is currently locked by a normalize run.**"
+        else:
+            _hdr = "🔒 **This case is currently locked by another session.**"
         st.warning(
-            "🔒 **This case is currently being processed by another session.**  \n"
+            f"{_hdr}  \n"
             f"started_at: `{_li.get('started_at', '?')}` · "
             f"host: `{_li.get('host', '?')}` · "
             f"pid: `{_pid_val}` · "
             f"user: `{_li.get('user', '?')}`  \n"
+            f"operation: `{_li.get('operation', 'unknown')}` · "
             f"start_step: `{_li.get('start_step', '?')}`"
             f"{_pid_dead_hint}"
         )
@@ -941,6 +973,7 @@ if mode == "Select Existing Case":
                 f"host: `{_li.get('host', '?')}` · "
                 f"pid: `{_li.get('pid', '?')}` · "
                 f"user: `{_li.get('user', '?')}` · "
+                f"operation: `{_li.get('operation', 'unknown')}` · "
                 f"start_step: `{_li.get('start_step', '?')}`"
             )
         if st.button("🗑️ Clear Stale Lock", key=f"clear_stale_lock_{selected_case}"):
@@ -1008,7 +1041,12 @@ if mode == "Select Existing Case":
         # Acquire case-level lock BEFORE running any subprocess.
         # If another session won the race between button click and execution,
         # bail out cleanly without touching their lock file.
-        _acquired = acquire_lock(selected_case, st.session_state.pipeline_start_step)
+        # Phase 4.6D — both Full Pipeline and Enrich+Format+Export are tagged "pipeline".
+        _acquired = acquire_lock(
+            selected_case,
+            st.session_state.pipeline_start_step,
+            operation="pipeline",
+        )
         if _acquired is None:
             st.session_state.pipeline_running = False
             st.error(
@@ -1269,8 +1307,17 @@ if mode == "Select Existing Case":
             )
 
         if _norm_lock_active:
+            # Phase 4.6D — surface what kind of run holds the lock
+            _norm_op = (_norm_lock_info or {}).get("operation", "")
+            _norm_op = (_norm_op or "").strip().lower()
+            if _norm_op == "pipeline":
+                _norm_what = "a pipeline run"
+            elif _norm_op == "normalize":
+                _norm_what = "another normalize run"
+            else:
+                _norm_what = "another session"
             st.info(
-                "🔒 Cannot normalize — case is being processed by another session. "
+                f"🔒 Cannot normalize — case is locked by {_norm_what}. "
                 "See the lock banner under Step 2 for details."
             )
 
@@ -1307,8 +1354,10 @@ if mode == "Select Existing Case":
         # ── Execute normalize when triggered ──
         if st.session_state.normalize_should_run:
             st.session_state.normalize_should_run = False
-            # Acquire same case-level lock as pipeline (Phase 2)
-            _norm_acq = acquire_lock(selected_case, 0)
+            # Acquire same case-level lock as pipeline (Phase 2).
+            # Phase 4.6D — tag this acquisition as "normalize" so the UI can
+            # distinguish it from a pipeline run.
+            _norm_acq = acquire_lock(selected_case, 0, operation="normalize")
             if _norm_acq is None:
                 st.session_state.normalize_running = False
                 st.error(

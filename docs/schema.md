@@ -460,3 +460,80 @@ classified as glossary / note / junk / AUTO_SKIP, an explicit
   empty, so "Requirement (Final)" falls through to Original.
 - Excluded sheet is present even when empty (header row only), so the
   workbook schema is consistent across cases.
+
+---
+
+## Phase 4.6D — Pipeline lock file (advisory)
+
+A case-level advisory lock prevents two Streamlit sessions from mutating
+the same case at the same time. The lock is purely cooperative — it has
+no kernel-level enforcement; it works because every entry point in
+`app.py` consults `read_lock_info()` before running.
+
+### Path
+
+```
+runs/<case_id>/.pipeline.lock
+```
+
+Excluded from version control (`runs/` is in `.gitignore`).
+
+### Schema
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `case_id` | string | — | Echo of the case ID for sanity checks. |
+| `started_at` | ISO 8601 string | — | When `acquire_lock()` ran. Drives the 2 h stale rule. |
+| `pid` | int | — | Acquiring process's PID. Informational; PID liveness does **not** override the stale rule. |
+| `host` | string | — | `socket.gethostname()` at acquire time. Informational. |
+| `user` | string | — | `getpass.getuser()` at acquire time. Informational. |
+| `start_step` | int | — | Pipeline step index the run began from (0 = full pipeline, 1 = enrich+format+export, 0 also for normalize). Insufficient on its own to distinguish run types — see `operation`. |
+| `operation` | string | `"unknown"` | **Phase 4.6D**. What kind of run is holding the lock. See allowed values below. |
+
+### `operation` allowed values
+
+| Value | Meaning | Acquired by |
+|-------|---------|-------------|
+| `"pipeline"` | Full Pipeline or Enrich+Format+Export is running. | Phase 2 — Run Full Pipeline / ⚡ Enrich + Format + Export |
+| `"normalize"` | Step 3.5 Normalize is running. | Step 3.5 — Run Normalize |
+| `"unknown"` | Anything else (caller did not specify, or specified an unrecognized value, or it is an old lock file from before Phase 4.6D). | Fallback in `acquire_lock()` |
+
+`acquire_lock(case_id, start_step, operation=...)` normalizes any
+unrecognized string (`None`, `""`, typos, future values) to `"unknown"`
+so a typo in a future caller cannot corrupt the schema.
+
+### UI rendering (Phase 4.6D)
+
+The active-lock banner under Step 2 picks a headline by `operation`:
+
+| `operation` | Headline shown to PM |
+|-------------|----------------------|
+| `"pipeline"` | `🔒 This case is currently locked by a pipeline run.` |
+| `"normalize"` | `🔒 This case is currently locked by a normalize run.` |
+| `"unknown"` or missing | `🔒 This case is currently locked by another session.` |
+
+Both the active-lock banner and the stale-lock banner additionally
+display `operation:` in their metadata line so debugging is easy when a
+lock looks suspicious.
+
+### Stale rule (unchanged)
+
+A lock is **stale** when *any* of the following is true:
+
+- The file is unparseable (invalid JSON / non-object).
+- `started_at` is missing or unparseable.
+- `now - started_at > 2 hours` (`PIPELINE_LOCK_STALE_HOURS`).
+
+PID liveness is **not** consulted by the stale rule — it appears in the
+banner as a hint only. Phase 4.6D does not change this.
+
+### Backward compatibility
+
+- Lock files written before Phase 4.6D have no `operation` field.
+  `read_lock_info()` parses them unchanged; the UI falls back to the
+  "another session" headline and shows `operation: unknown` in the
+  metadata line.
+- All callers explicitly pass `operation=` after Phase 4.6D, so freshly
+  written lock files always carry the field.
+- The stale rule is identical, so any operational tooling that checks
+  age continues to work.
