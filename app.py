@@ -1308,6 +1308,26 @@ if counts:
             unsafe_allow_html=True,
         )
 
+# Phase 4.6G — surface chunks that were soft-failed during extraction so PM
+# notices they didn't make it into the compliance matrix.
+_errors_path = RUNS_DIR / selected_case / "extract_errors.jsonl"
+if _errors_path.exists():
+    try:
+        _err_count = sum(
+            1 for ln in _errors_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+            if ln.strip()
+        )
+    except Exception:
+        _err_count = 0
+    if _err_count > 0:
+        st.warning(
+            f"⚠ **{_err_count} chunk(s) were skipped during extraction** "
+            f"(LLM retry exhausted). Those chunks are not represented in the "
+            f"compliance matrix. See `extract_errors.jsonl` under **Advanced "
+            f"Outputs** below for details, or rerun the pipeline from the "
+            f"command line with `--retry-failed-chunks` to re-attempt them."
+        )
+
 run_dir = RUNS_DIR / selected_case
 XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
@@ -1320,6 +1340,7 @@ ADVANCED_FILES = [
     ("requirements_enriched.json", "Requirements (enriched)"),
     ("requirements_clean.json",    "Requirements (clean)"),
     ("requirements.partial.jsonl", "Requirements (partial / resume)"),
+    ("extract_errors.jsonl",       "Extraction errors (soft-fail log)"),
     ("manifest.json",              "Manifest"),
 ]
 

@@ -599,3 +599,84 @@ produce.
   line in `scripts/run_case.py` (silent today)
 - Cancel / interrupt button
 - Persisted run history / per-run timeline export
+
+---
+
+## Phase 4.6G — Bad chunk soft-fail
+
+Before Phase 4.6G a single chunk that the LLM could not return parseable
+JSON for (after the built-in 3 retries) would `raise RuntimeError`,
+exiting the extract subprocess and stopping the whole pipeline. For very
+large documents (e.g. a 2979-chunk specification) one unlucky chunk was
+enough to block the entire case, because the failure was deterministic
+on resume — same chunk text + same model = same parse failure.
+
+Phase 4.6G changes the chunk loop so that retry-exhausted chunks are
+**recorded and skipped**, with a threshold gate that still aborts when
+failures look systemic.
+
+### `runs/<case>/extract_errors.jsonl`
+
+Append-only across runs (history of every soft-failed chunk). One JSON
+object per line:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `file` | string | Source filename whose chunk failed (matches `requirements.partial.jsonl`'s `file`). |
+| `chunk` | int | 1-indexed chunk number within `file`. |
+| `total` | int | Total chunks in `file` at the time of failure. Useful when chunk counts change between runs. |
+| `error` | string | First 500 chars (ASCII-replace) of the `RuntimeError` raised by `call_llm_json_with_retry`. Typically includes a preview of the raw LLM response. |
+| `model` | string | `args.model` at the time of failure (matches the model name in `runs/_debug/llm_raw_*.txt` filenames). |
+| `ts` | ISO 8601 string | `now_iso()` at the time the soft-fail was recorded. |
+| `chunk_chars` | int | `len(chunk)` — useful for spotting "always the long chunks" patterns. |
+
+### `requirements.partial.jsonl` — new optional `failed_chunk` field
+
+Records written by `append_partial(..., failed=True)` carry an extra
+`"failed_chunk": true` field. The `requirements` array is empty (`[]`).
+A legitimately empty chunk (e.g. boilerplate, signature page) is also
+written with `requirements: []` but **without** the `failed_chunk` field,
+so the two cases are distinguishable.
+
+### Threshold gate (CLI flags on `scripts/extract_requirements_llm.py`)
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--max-failed-chunks` | `20` | Abort the run if the absolute count of failed chunks in this run exceeds this. `0` aborts on the first failure. |
+| `--max-failed-pct` | `5.0` | Abort if `failed_chunks / attempted_chunks` in this run exceeds this percentage. Only applies once `--min-attempted-for-pct` chunks have been attempted. |
+| `--min-attempted-for-pct` | `50` | Disable the `--max-failed-pct` gate until this many chunks have been attempted in this run. Prevents small-sample noise (e.g. `1/16 = 6.25%`) from tripping the gate. |
+| `--retry-failed-chunks` | off | On resume, re-attempt chunks previously marked `failed_chunk=true`. Default: skip them like any other completed chunk. |
+
+`attempted_chunks` excludes resume-skipped chunks — only chunks that
+went through `call_llm_json_with_retry` in this run count.
+
+The gate uses an OR: either an absolute-count overflow or a percentage
+overflow aborts. When the gate trips, the run still raises
+`RuntimeError`, but the failed chunks that have already been recorded
+(in `extract_errors.jsonl` and as `failed_chunk=true` rows in
+`partial.jsonl`) remain on disk for inspection.
+
+### Resume behavior
+
+| Scenario | `failed_chunk=true` row in partial | Behavior |
+|----------|------------------------------------|----------|
+| Default resume | yes | Treated as done — re-run skips the chunk. |
+| `--retry-failed-chunks` | yes | Removed from `done_keys` — re-run re-attempts the chunk. If it fails again, a new `extract_errors.jsonl` row is appended (history is preserved). |
+| Legitimately empty chunk (no `failed_chunk` field) | no | Treated as done in both modes — never re-attempted. |
+
+### UI surfacing (Streamlit)
+
+- `extract_errors.jsonl` appears in **Step 3 → Advanced Outputs** alongside the other intermediate artifacts.
+- When `extract_errors.jsonl` exists with one or more rows, **Step 3** shows a yellow warning banner above the download cards with the count and instructions for retry.
+
+### End-of-run stdout
+
+The extract script prints a summary line that the UI streams through
+verbatim:
+
+```
+[OK] Output: runs/<case>/requirements.json
+[OK] Requirements count: <N> (skipped <K> chunk(s))   ← parenthetical only when K > 0
+[OK] Partial saved: runs/<case>/requirements.partial.jsonl
+[WARN] <K> chunk(s) failed extraction; see runs/<case>/extract_errors.jsonl   ← only when K > 0
+```
