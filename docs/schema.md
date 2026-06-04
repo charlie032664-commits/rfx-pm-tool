@@ -556,8 +556,9 @@ parser in `app.py` (`_parse_progress_line`).
 | `[PROGRESS] <file> chunk <i>/<N>` | `extract_requirements_llm.py` before each chunk's LLM call | Advance chunk slot to `i / N`; recompute ETA |
 | `[SKIP] <file> chunk <i>/<N> already done` | `extract_requirements_llm.py` resume path | Same as `[PROGRESS]` — advances counter |
 | `  [<i>/<N>] <req_id> …` | `normalize_requirements_llm.py` per item | Advance item slot to `i / N · req_id` |
+| `[PROGRESS] enrich item <i>/<N> req_id=<id>` | `run_case.py` per item | Advance item slot to `i / N · req_id` |
 | `[WARN] LLM call failed (attempt <i>/<N>) … -> sleep <s>s` | `extract_requirements_llm.py` retry | Show retry warning |
-| `[WARN] LLM enrich attempt <i>/<N> … -> sleep <s>s` | `run_case.py` retry (Phase 4.6F.2 will wire visible enrich progress) | Show retry warning |
+| `[WARN] LLM enrich attempt <i>/<N> … -> sleep <s>s` | `run_case.py` retry | Show retry warning |
 
 Any line that doesn't match any pattern is appended to the per-step log
 expander unchanged. A step that emits **no** events still works — the
@@ -594,9 +595,7 @@ produce.
 - Normalize per-item progress
 - LLM retry warning surface
 
-**Out of scope (deferred to Phase 4.6F.2):**
-- Enrich per-item progress — requires a new `[PROGRESS] enrich i/N …`
-  line in `scripts/run_case.py` (silent today)
+**Out of scope:**
 - Cancel / interrupt button
 - Persisted run history / per-run timeline export
 

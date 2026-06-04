@@ -481,8 +481,11 @@ def enrich_requirements(
     enriched: List[Dict[str, Any]] = []
 
     reqs: List[Dict[str, Any]] = req_doc.get("requirements", []) or []
+    total = len(reqs)
 
-    for r in reqs:
+    for i, r in enumerate(reqs, start=1):
+        # Phase 4.6F.2 — per-item progress for the streaming UI
+        print(f"[PROGRESS] enrich item {i}/{total} req_id={r.get('req_id') or '?'}")
         req_id = r.get("req_id", "")
         text = r.get("requirement", "")
         notes = r.get("notes", "")

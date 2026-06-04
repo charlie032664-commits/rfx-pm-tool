@@ -254,6 +254,9 @@ def run_step_streaming(cmd: list, on_line) -> tuple[int, str]:
 
 _RE_CHUNKS_TOTAL = re.compile(r'^\[INFO\]\s+(\S+):\s+(\d+)\s+chunks\s*$')
 _RE_CHUNK        = re.compile(r'^\[(?:PROGRESS|SKIP)\]\s+(\S+)\s+chunk\s+(\d+)/(\d+)\b')
+_RE_ENRICH_ITEM  = re.compile(
+    r'^\[PROGRESS\]\s+enrich\s+item\s+(\d+)/(\d+)(?:\s+req_id=(\S+))?\s*$'
+)
 _RE_ITEM         = re.compile(r'^\s*\[(\d+)/(\d+)\]\s+(\S+)')
 _RE_RETRY        = re.compile(
     r'^\[WARN\]\s+LLM\s+(?:call failed\s+\(attempt\s+|enrich\s+attempt\s+)'
@@ -269,6 +272,11 @@ def _parse_progress_line(line: str) -> dict | None:
     if m:
         return {"kind": "chunk", "file": m.group(1),
                 "done": int(m.group(2)), "total": int(m.group(3))}
+    m = _RE_ENRICH_ITEM.match(line)
+    if m:
+        return {"kind": "item", "done": int(m.group(1)),
+                "total": int(m.group(2)),
+                "req_id": m.group(3) or "?"}
     m = _RE_CHUNKS_TOTAL.match(line)
     if m:
         return {"kind": "chunks_total", "file": m.group(1),
