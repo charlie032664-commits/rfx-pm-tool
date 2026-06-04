@@ -27,8 +27,17 @@ HEADERS = [
     "Priority",
     "Category",
     "Responsible Team",
+    "Stakeholder",
     "Compliance Status",
+    # ── Phase 4.6E.2: PM final wording (fallback: PM edit → normalized → original) ──
+    "Requirement (Final)",
     "Requirement (Original)",
+    # ── Phase 4.6 normalization output (filled by normalize_requirements_llm.py)
+    "Requirement (Normalized)",
+    "Rewrite Reason",
+    "Rewrite Confidence",
+    "Rewrite Review",
+    # ── existing columns continue ──
     "Risk Tags",
     "Our Response",
     "Gap / Notes",
@@ -37,6 +46,234 @@ HEADERS = [
 ]
 
 HIDDEN_COLS: set = set()
+
+
+# ── Big category buckets ─────────────────────────────────────────────────────
+# Maps small category (case-insensitive) → big-category sheet name.
+# Multi-value categories (e.g. "Compliance, Security") use only the FIRST value
+# to avoid double counting. Blank or unmapped categories fall through to "Others".
+
+BIG_CATEGORY_MAP: Dict[str, str] = {
+    # ── Hardware ────────────────────────────────────────────────────────────
+    "hardware":      "Hardware",
+    "platform":      "Hardware",
+    "cpu":           "Hardware",
+    "memory":        "Hardware",
+    "pcie":          "Hardware",
+    "storage":       "Hardware",
+    "storage/hw":    "Hardware",
+    "network":       "Hardware",
+    "wireless":      "Hardware",
+    "lan":           "Hardware",
+    "display":       "Hardware",
+    "interface":     "Hardware",
+    "i/o":           "Hardware",
+    "io":            "Hardware",
+    "power":         "Hardware",
+    "tpm":           "Hardware",
+    "performance":   "Hardware",
+    # ── Software ────────────────────────────────────────────────────────────
+    "software":      "Software",
+    "bios":          "Software",
+    "bmc":           "Software",
+    "firmware":      "Software",
+    "driver":        "Software",
+    "os":            "Software",
+    "management":    "Software",
+    "storage/sw":    "Software",
+    # ── Mechanical ──────────────────────────────────────────────────────────
+    "mechanical":     "Mechanical",
+    "serviceability": "Mechanical",
+    "chassis":        "Mechanical",
+    "bezel":          "Mechanical",
+    "dimension":      "Mechanical",
+    "label":          "Mechanical",
+    "packaging":      "Mechanical",
+    # ── Regulatory ──────────────────────────────────────────────────────────
+    "regulatory":    "Regulatory",
+    "emc":           "Regulatory",
+    "safety":        "Regulatory",
+    "ce":            "Regulatory",
+    "fcc":           "Regulatory",
+    "rohs":          "Regulatory",
+    "certification": "Regulatory",
+    "compliance":    "Regulatory",
+    "security":      "Regulatory",
+    "legal":         "Regulatory",
+    # ── Environmental ───────────────────────────────────────────────────────
+    "environmental": "Environmental",
+    "temperature":   "Environmental",
+    "thermal":       "Environmental",
+    "humidity":      "Environmental",
+    "shock":         "Environmental",
+    "vibration":     "Environmental",
+    "reliability":   "Environmental",
+    # ── Others (explicit; blank/unmapped also default to Others) ────────────
+    "general":       "Others",
+    "commercial":    "Others",
+    "documentation": "Others",
+    "unknown":       "Others",
+}
+
+BIG_CATEGORY_ORDER = [
+    "Hardware", "Software", "Mechanical", "Regulatory", "Environmental", "Others",
+]
+
+
+def _first_category(category) -> str:
+    """Return the first category from a list or comma-joined string."""
+    if isinstance(category, list):
+        return str(category[0]).strip() if category else ""
+    s = str(category or "").strip()
+    if "," in s:
+        return s.split(",", 1)[0].strip()
+    return s
+
+
+def _to_big_category(category) -> str:
+    """Map first-of small category to its big-category bucket. Unknown/blank → Others."""
+    first = _first_category(category)
+    return BIG_CATEGORY_MAP.get(first.lower(), "Others")
+
+
+def _has_redflag(r: Dict[str, Any]) -> bool:
+    msgs = r.get("risk_tags") or r.get("redflag_tags") or r.get("redflag_messages") or []
+    return bool(msgs and str(msgs) not in ("[]", ""))
+
+
+def bucket_by_big_category(reqs: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+    """Group requirements into the 6 big-category buckets.
+
+    All buckets are initialized (may be empty) so that empty-sheet creation
+    downstream is deterministic. Preserves caller-provided ordering within
+    each bucket (so a pre-sorted main_reqs stays sorted inside each sheet).
+    """
+    buckets: Dict[str, List[Dict[str, Any]]] = {bc: [] for bc in BIG_CATEGORY_ORDER}
+    for r in reqs:
+        big = _to_big_category(r.get("category", ""))
+        buckets[big].append(r)
+    return buckets
+
+
+def write_summary_sheet(ws, buckets: Dict[str, List[Dict[str, Any]]]) -> None:
+    """Write a pivot of counts per (Group, small Category).
+
+    Columns: Group | Category | Total | MUST | SHOULD | MAY | INFO
+             | NEED_REVIEW | COMPLIANT | PARTIAL | NON_COMPLIANT | Owner(s)
+
+    Rows are one per (Group, small Category) actually present in the data.
+    Multi-value categories use the FIRST value (same rule as bucket_by_big_category).
+    A final "Total" grand-row sums all numeric columns.
+    """
+    headers = [
+        "Group", "Category", "Total",
+        "MUST", "SHOULD", "MAY", "INFO",
+        "NEED_REVIEW", "COMPLIANT", "PARTIAL", "NON_COMPLIANT",
+        "Owner(s)",
+    ]
+    ws.append(headers)
+
+    grand = {"total": 0, "must": 0, "should": 0, "may": 0, "info": 0,
+             "nr": 0, "comp": 0, "part": 0, "non": 0}
+
+    for big_cat in BIG_CATEGORY_ORDER:
+        items = buckets.get(big_cat, [])
+        if not items:
+            continue
+        # Sub-group by small category (first-of), stable alphabetical order
+        by_small: Dict[str, List[Dict[str, Any]]] = {}
+        for r in items:
+            small = _first_category(r.get("category", "")) or "(blank)"
+            by_small.setdefault(small, []).append(r)
+        for small in sorted(by_small.keys(), key=str.lower):
+            sub = by_small[small]
+            total  = len(sub)
+            must   = sum(1 for r in sub if str(r.get("must_level", "")).upper() == "MUST")
+            should = sum(1 for r in sub if str(r.get("must_level", "")).upper() == "SHOULD")
+            may    = sum(1 for r in sub if str(r.get("must_level", "")).upper() == "MAY")
+            info   = sum(1 for r in sub if str(r.get("must_level", "")).upper() == "INFO")
+            # NOTE: status COMPLIANT/PARTIAL/NON-COMPLIANT come from responses.json,
+            # already merged into r["status"] above. The status string uses a HYPHEN
+            # ("NON-COMPLIANT"); the column header keeps underscore as requested.
+            status_u = lambda r: str(r.get("status", "")).upper()
+            nr     = sum(1 for r in sub if status_u(r) == "NEED_REVIEW")
+            comp   = sum(1 for r in sub if status_u(r) == "COMPLIANT")
+            part   = sum(1 for r in sub if status_u(r) == "PARTIAL")
+            non    = sum(1 for r in sub if status_u(r) == "NON-COMPLIANT")
+            owners = sorted({
+                str(r.get("owner", "")).strip()
+                for r in sub
+                if str(r.get("owner", "")).strip()
+            }, key=str.lower)
+            ws.append([big_cat, small, total, must, should, may, info,
+                       nr, comp, part, non, ", ".join(owners)])
+            grand["total"]  += total
+            grand["must"]   += must
+            grand["should"] += should
+            grand["may"]    += may
+            grand["info"]   += info
+            grand["nr"]     += nr
+            grand["comp"]   += comp
+            grand["part"]   += part
+            grand["non"]    += non
+
+    # Grand-total row (Owner(s) column intentionally blank)
+    ws.append([
+        "Total", "",
+        grand["total"], grand["must"], grand["should"], grand["may"], grand["info"],
+        grand["nr"], grand["comp"], grand["part"], grand["non"],
+        "",
+    ])
+
+    # ── Styling ────────────────────────────────────────────────────────────
+    header_font  = Font(bold=True, color="FFFFFF", name="Arial")
+    header_fill  = PatternFill("solid", fgColor="1F4E79")
+    header_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    thin = Side(style="thin", color="D9D9D9")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    for c in range(1, ws.max_column + 1):
+        cell = ws.cell(row=1, column=c)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = header_align
+        cell.border = border
+
+    numeric_cols = {3, 4, 5, 6, 7, 8, 9, 10, 11}
+    for row in range(2, ws.max_row + 1):
+        for col in range(1, ws.max_column + 1):
+            cell = ws.cell(row=row, column=col)
+            cell.border = border
+            if col in numeric_cols:
+                cell.alignment = Alignment(vertical="center", horizontal="right")
+            else:
+                cell.alignment = Alignment(vertical="center", horizontal="left", wrap_text=True)
+
+    # Bold + tinted grand-total row (last row)
+    for col in range(1, ws.max_column + 1):
+        cell = ws.cell(row=ws.max_row, column=col)
+        cell.font = Font(bold=True, name="Arial")
+        cell.fill = PatternFill("solid", fgColor="E3F2FD")
+
+    widths = {
+        1: 14,   # Group
+        2: 18,   # Category
+        3: 8,    # Total
+        4: 8,    # MUST
+        5: 9,    # SHOULD
+        6: 7,    # MAY
+        7: 7,    # INFO
+        8: 14,   # NEED_REVIEW
+        9: 12,   # COMPLIANT
+        10: 10,  # PARTIAL
+        11: 16,  # NON_COMPLIANT
+        12: 32,  # Owner(s)
+    }
+    for col_idx, w in widths.items():
+        ws.column_dimensions[get_column_letter(col_idx)].width = w
+
+    ws.auto_filter.ref = f"A1:{get_column_letter(ws.max_column)}{ws.max_row}"
+    ws.freeze_panes = "C2"
 
 
 def read_json(p: Path) -> Dict[str, Any]:
@@ -127,36 +364,47 @@ def _load_reqs(data: Dict[str, Any]) -> List[Dict[str, Any]]:
     return out
 
 
-def split_sheets(reqs: List[Dict[str, Any]]) -> Tuple[List, List, List]:
-    glossary, notes, main = [], [], []
-    for r in reqs:
-        status = str(r.get("status") or "")
-        cat_str = _category_str(r.get("category", []))
-        owner = str(r.get("owner") or "")
-        must_level = str(r.get("must_level") or "").upper()
-        req_text = str(r.get("requirement") or "")
+def split_sheets(reqs: List[Dict[str, Any]]) -> Tuple[List, List, List, List, List]:
+    """Route items into 5 buckets — main / glossary / notes / skipped / pm_excluded.
 
-        is_glossary = (status == "AUTO_SKIP") or ("glossary" in cat_str.lower())
-        if is_glossary:
-            glossary.append(r)
+    Routing precedence (first match wins):
+      0. PM Excluded — exclude_from_matrix is True (Phase 4.6E.2; PM-explicit
+                       decision wins over every type-based routing below)
+      1. Glossary   — type == "glossary"  OR  risk_tags contains "GLOSSARY"
+      2. Notes      — type == "note"
+      3. Skipped    — type == "junk"  OR  status == "AUTO_SKIP"
+                      (catches obvious-noise rows: dates, names, ticks, etc.,
+                       and any AUTO_SKIP rows that weren't glossary/note —
+                       e.g., short colon-prefixed values the enricher
+                       mis-tagged.)
+      4. Main       — everything else (real requirements)
+    """
+    main, glossary, notes, skipped, pm_excluded = [], [], [], [], []
+    for r in reqs:
+        # Phase 4.6E.2 — PM explicit exclude takes highest priority
+        if r.get("exclude_from_matrix") is True:
+            pm_excluded.append(r)
             continue
 
-        msgs = r.get("risk_tags") or r.get("redflag_tags") or r.get("redflag_messages") or []
-        has_redflag = bool(msgs and str(msgs) not in ("[]", ""))
-        req_type = str(r.get("type") or "")
+        req_type = str(r.get("type") or "").lower()
+        status   = str(r.get("status") or "").upper()
+        raw_tags = r.get("risk_tags") or []
+        if not isinstance(raw_tags, list):
+            raw_tags = [raw_tags]
+        tag_set = {str(t).upper() for t in raw_tags}
 
-        is_note = (
-            must_level in ("INFO", "")
-            and status != "NEED_REVIEW"
-            and not has_redflag
-            and req_type in ("note", "junk")
-        )
-        if is_note:
+        if req_type == "glossary" or "GLOSSARY" in tag_set:
+            glossary.append(r)
+            continue
+        if req_type == "note":
             notes.append(r)
-        else:
-            main.append(r)
+            continue
+        if req_type == "junk" or status == "AUTO_SKIP":
+            skipped.append(r)
+            continue
+        main.append(r)
 
-    return main, glossary, notes
+    return main, glossary, notes, skipped, pm_excluded
 
 
 def apply_sheet_style(ws) -> None:
@@ -178,7 +426,10 @@ def apply_sheet_style(ws) -> None:
     ws.freeze_panes = "A2"
 
     wrap_cols = {
+        "Requirement (Final)",
         "Requirement (Original)",
+        "Requirement (Normalized)",
+        "Stakeholder",
         "Risk Tags",
         "Our Response",
         "Gap / Notes",
@@ -200,8 +451,14 @@ def apply_sheet_style(ws) -> None:
         "Priority": 12,
         "Category": 15,
         "Responsible Team": 14,
+        "Stakeholder": 22,
         "Compliance Status": 18,
+        "Requirement (Final)": 60,
         "Requirement (Original)": 60,
+        "Requirement (Normalized)": 60,
+        "Rewrite Reason": 24,
+        "Rewrite Confidence": 12,
+        "Rewrite Review": 10,
         "Risk Tags": 22,
         "Our Response": 50,
         "Gap / Notes": 35,
@@ -213,10 +470,42 @@ def apply_sheet_style(ws) -> None:
         if h in HIDDEN_COLS:
             ws.column_dimensions[get_column_letter(idx)].hidden = True
 
-    # Conditional formatting by Status
+    # Conditional formatting
     if ws.max_row >= 2:
         last_col = get_column_letter(ws.max_column)
         data_range = f"A2:{last_col}{ws.max_row}"
+
+        # ── Phase 4.6 normalization highlighting ───────────────────────────
+        # Insert FIRST + stopIfTrue=True so the column-specific Normalized /
+        # Review colour wins over the row-wide Status colour added below.
+        if "Requirement (Normalized)" in HEADERS and "Rewrite Review" in HEADERS:
+            nc  = HEADERS.index("Requirement (Normalized)") + 1
+            ncl = get_column_letter(nc)
+            rc  = HEADERS.index("Rewrite Review") + 1
+            rcl = get_column_letter(rc)
+            # Normalized cell → light yellow when row is flagged REVIEW
+            ws.conditional_formatting.add(
+                f"{ncl}2:{ncl}{ws.max_row}",
+                FormulaRule(formula=[f'${rcl}2="REVIEW"'],
+                            fill=PatternFill("solid", fgColor="FFE699"),
+                            stopIfTrue=True)
+            )
+            # Normalized cell → light green when normalized has content and not REVIEW
+            ws.conditional_formatting.add(
+                f"{ncl}2:{ncl}{ws.max_row}",
+                FormulaRule(formula=[f'AND(${ncl}2<>"",${rcl}2<>"REVIEW")'],
+                            fill=PatternFill("solid", fgColor="DDF0E0"),
+                            stopIfTrue=True)
+            )
+            # Review cell → bold yellow when "REVIEW"
+            ws.conditional_formatting.add(
+                f"{rcl}2:{rcl}{ws.max_row}",
+                FormulaRule(formula=[f'${rcl}2="REVIEW"'],
+                            fill=PatternFill("solid", fgColor="FFD966"),
+                            stopIfTrue=True)
+            )
+
+        # ── Status row colouring (lower priority; added AFTER Normalized) ──
         sc = HEADERS.index("Compliance Status") + 1
         sl = get_column_letter(sc)
         _status_colors = [
@@ -249,6 +538,12 @@ def write_sheet(ws, reqs: List[Dict[str, Any]]) -> None:
         must_level  = r.get("must_level", "")
         category    = _category_str(r.get("category", []))
         owner       = r.get("owner", "")
+        # Stakeholder — list of additional involved teams, comma-joined
+        _sh = r.get("stakeholder") or []
+        if isinstance(_sh, list):
+            stakeholder = ", ".join(str(s).strip() for s in _sh if str(s).strip())
+        else:
+            stakeholder = str(_sh).strip()
         status      = r.get("status", "")
         req_text    = r.get("requirement", "")
         source      = _source_ref(r)
@@ -260,9 +555,37 @@ def write_sheet(ws, reqs: List[Dict[str, Any]]) -> None:
         gap_notes    = r.get("gap") or ""
         evidence     = r.get("evidence_needed") or r.get("evidence") or ""
 
+        # ── Phase 4.6 normalization fields ──
+        normalized     = (r.get("normalized_requirement") or "").strip()
+        rewrite_reason = (r.get("rewrite_reason") or "").strip()
+        rewrite_conf   = r.get("rewrite_confidence", 0.0)
+        needs_review   = bool(r.get("needs_rewrite_review", False))
+        # Confidence shows "0.00" only when normalize was attempted; blank otherwise
+        if rewrite_reason:
+            try:
+                conf_str = f"{float(rewrite_conf):.2f}"
+            except (TypeError, ValueError):
+                conf_str = "0.00"
+        else:
+            conf_str = ""
+        review_str = "REVIEW" if needs_review else ""
+
+        # ── Phase 4.6E.2: Requirement (Final) fallback chain ──
+        #     PM edit  →  LLM normalized  →  Original
+        _pm_final = (r.get("final_requirement") or "").strip()
+        if _pm_final:
+            final_req = _pm_final
+        elif normalized:
+            final_req = normalized
+        else:
+            final_req = req_text
+
         ws.append([
-            req_id, must_level, category, owner, status,
-            req_text, risk_str,
+            req_id, must_level, category, owner, stakeholder, status,
+            final_req,                                   # ← Phase 4.6E.2 col 7
+            req_text,
+            normalized, rewrite_reason, conf_str, review_str,
+            risk_str,
             our_response, gap_notes, evidence,
             source,
         ])
@@ -281,6 +604,41 @@ def write_sheet(ws, reqs: List[Dict[str, Any]]) -> None:
             cell.font = Font(name="Arial", size=10, color="0C447C")
 
 
+def _merge_responses(reqs: List[Dict[str, Any]], responses: Dict[str, Any]) -> None:
+    """Apply PM responses onto items in-place (Phase 4.6E.2).
+
+    Runs BEFORE split_sheets so that `exclude_from_matrix=True` can drive
+    routing into the dedicated 'Excluded' sheet. Items without a matching
+    response entry are untouched.
+
+    For excluded rows, the Gap / Notes column is prefixed with
+    "[EXCLUDED: <reason>]" (or "[EXCLUDED]" if no reason was given) so the
+    Excluded sheet can show the reason without a separate column.
+    """
+    for r in reqs:
+        resp = responses.get(r.get("req_id", ""), {})
+        if not resp:
+            continue
+        if resp.get("status"):           r["status"]            = resp["status"]
+        if resp.get("vendor_comment"):   r["vendor_comment"]    = resp["vendor_comment"]
+        if resp.get("gap"):              r["gap"]               = resp["gap"]
+        if resp.get("ai_draft"):         r["ai_draft"]          = resp["ai_draft"]
+        # Phase 4.6E.2 — three new fields
+        if resp.get("final_requirement"):
+            r["final_requirement"] = resp["final_requirement"]
+        r["exclude_from_matrix"] = bool(resp.get("exclude_from_matrix", False))
+        r["exclude_reason"]      = str(resp.get("exclude_reason", "") or "")
+
+    # Prefix [EXCLUDED] tag to Gap / Notes for excluded rows. Done in a second
+    # pass so the source `r["gap"]` is the freshly-merged value, not stale.
+    for r in reqs:
+        if r.get("exclude_from_matrix") is True:
+            reason = (r.get("exclude_reason") or "").strip()
+            tag    = f"[EXCLUDED: {reason}]" if reason else "[EXCLUDED]"
+            gap    = (r.get("gap") or "").strip()
+            r["gap"] = f"{tag} {gap}" if gap else tag
+
+
 def export_excel(data: Dict[str, Any], out_xlsx: Path, responses_path: Optional[Path] = None) -> None:
     # Load responses.json (owner-filled data)
     responses: Dict[str, Any] = {}
@@ -295,21 +653,11 @@ def export_excel(data: Dict[str, Any], out_xlsx: Path, responses_path: Optional[
     wb.remove(wb.active)
 
     reqs = _load_reqs(data)
-    main_reqs, glossary_reqs, notes_reqs = split_sheets(reqs)
-
-    # Merge owner responses into main_reqs
-    for r in main_reqs:
-        rid = r.get("req_id", "")
-        resp = responses.get(rid, {})
-        if resp:
-            if resp.get("status"):
-                r["status"] = resp["status"]
-            if resp.get("vendor_comment"):
-                r["vendor_comment"] = resp["vendor_comment"]
-            if resp.get("gap"):
-                r["gap"] = resp["gap"]
-            if resp.get("ai_draft"):
-                r["ai_draft"] = resp["ai_draft"]
+    # Phase 4.6E.2: merge responses BEFORE split so exclude_from_matrix routes
+    # rows into the dedicated Excluded sheet (replaces the legacy post-split
+    # merge that only touched main_reqs).
+    _merge_responses(reqs, responses)
+    main_reqs, glossary_reqs, notes_reqs, skipped_reqs, pm_excluded_reqs = split_sheets(reqs)
 
     # ── PM 排序：NEED_REVIEW 先 > 有 Redflag 先 > MUST 先 > Category ──────────
     _status_order = {"NEED_REVIEW": 0, "INTERNAL_ALIGN": 1, "ASK_CUSTOMER": 2,
@@ -331,9 +679,25 @@ def export_excel(data: Dict[str, Any], out_xlsx: Path, responses_path: Optional[
         )
     main_reqs = sorted(main_reqs, key=_sort_key)
 
+    # Sheet order: Compliance Matrix (總表, sheet 1) → By_Category_Summary (sheet 2)
+    # → 6 big-category sheets numbered 3..8 → Glossary → Notes.
+    # The display name is numbered ("3. Hardware") for customer-facing readability,
+    # but the internal Group label inside By_Category_Summary stays "Hardware".
     write_sheet(wb.create_sheet("Compliance Matrix"), main_reqs)
-    write_sheet(wb.create_sheet("Glossary"),          glossary_reqs)
-    write_sheet(wb.create_sheet("Notes"),             notes_reqs)
+
+    # Bucket the already-sorted main_reqs so each big-category sheet preserves
+    # the same sort order (NEED_REVIEW > redflag > MUST > category).
+    buckets = bucket_by_big_category(main_reqs)
+    write_summary_sheet(wb.create_sheet("By_Category_Summary"), buckets)
+    for idx, big_cat in enumerate(BIG_CATEGORY_ORDER, start=3):
+        sheet_name = f"{idx}. {big_cat}"
+        write_sheet(wb.create_sheet(sheet_name), buckets[big_cat])
+
+    write_sheet(wb.create_sheet("Glossary"), glossary_reqs)
+    write_sheet(wb.create_sheet("Notes"),    notes_reqs)
+    write_sheet(wb.create_sheet("Skipped"),  skipped_reqs)
+    # Phase 4.6E.2 — PM-excluded sheet (placed after Skipped)
+    write_sheet(wb.create_sheet("Excluded"), pm_excluded_reqs)
 
     out_xlsx.parent.mkdir(parents=True, exist_ok=True)
     wb.save(out_xlsx)
@@ -387,7 +751,10 @@ def main():
 
     print(f"[OK] Input : {in_path}")
     print(f"[OK] Output: {out_path}")
-    print("[OK] Sheets: Compliance Matrix, Glossary, Notes")
+    print("[OK] Sheets: Compliance Matrix, By_Category_Summary, "
+          "3. Hardware, 4. Software, 5. Mechanical, "
+          "6. Regulatory, 7. Environmental, 8. Others, "
+          "Glossary, Notes, Skipped, Excluded")
 
 
 if __name__ == "__main__":

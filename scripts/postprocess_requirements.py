@@ -40,12 +40,95 @@ _RFQ_TABLE_ID_PATTERNS = [
     re.compile(r"^ROW_ID=\d+$"),
 ]
 
-# Global AI sequence counter (single stream across all sources)
+# Global AI sequence counter — used for *all* system-generated ids.
+# Phase 4 ID policy (revised):
+#   - RFQ-* : customer-supplied id from a trusted structured source
+#             (e.g. IBM table [ROW_ID=HOST-1] → RFQ-HOST-001,
+#              Nokia simple_list xlsx ID column "1" → RFQ-001)
+#   - AI-NNN: system-generated when no trustworthy id exists
+#             (e.g. HPE doc_schema rule="AI auto" → demote any LLM-hallucinated
+#              RFQ-* to AI-NNN)
 _AI_SEQ = {"n": 0}
 
 
 def _reset_ai_seq():
     _AI_SEQ["n"] = 0
+
+
+def _next_ai_id() -> str:
+    """Return next AI-<NNN> with a single global counter."""
+    _AI_SEQ["n"] += 1
+    return f"AI-{_AI_SEQ['n']:03d}"
+
+
+# ── Phase 4: doc_schema-driven req_id grounding ──────────────────────────────
+# Goal: do NOT trust a "RFQ-HOST-NNN"-style req_id unless either:
+#   (a) the source file's `req_id_rule` in inbound/<case>/meta/doc_schema.json
+#       is a structured rule (e.g. "HOST N -> RFQ-HOST-{N:03d}, ..."), or
+#   (b) the requirement text/notes carries a [ROW_ID=...] evidence marker that
+#       confirms the prefix.
+# Otherwise the id is treated as LLM-hallucinated and demoted to AI-<NNN>.
+
+def load_doc_schema(enriched_in_path: Path) -> Dict[str, Any]:
+    """Find inbound/<case>/meta/doc_schema.json given the enriched.json path.
+    Returns {} if not found or unreadable. Best-effort path walk so callers can
+    pass either an absolute or a working-dir-relative path to enriched.json."""
+    p = Path(enriched_in_path)
+    if not p.exists():
+        return {}
+    case_id = p.parent.name
+    for ancestor in p.parents:
+        candidate = ancestor / "inbound" / case_id / "meta" / "doc_schema.json"
+        if candidate.exists():
+            try:
+                data = json.loads(candidate.read_text(encoding="utf-8"))
+                return data if isinstance(data, dict) else {}
+            except Exception:
+                return {}
+    return {}
+
+
+def _file_req_id_rule(doc_schema: Dict[str, Any], filename: str) -> str:
+    """Return the req_id_rule string for the named file.
+
+    Prefers per-file rule from doc_schema.files[]; falls back to the legacy
+    global rule. Returns "" when nothing is set.
+    """
+    if not doc_schema or not filename:
+        return str((doc_schema or {}).get("req_id_rule") or "").strip()
+    for f in (doc_schema.get("files") or []):
+        if f.get("file") == filename:
+            return str(f.get("req_id_rule") or "").strip()
+    return str(doc_schema.get("req_id_rule") or "").strip()
+
+
+def _is_structured_req_id_rule(rule: str) -> bool:
+    """True iff the rule indicates the source file actually carries
+    structured row IDs (not the placeholder 'AI auto')."""
+    if not rule:
+        return False
+    norm = rule.strip().lower()
+    return norm not in ("ai auto", "ai 自動編號", "ai 自动编号")
+
+
+_ROW_ID_EVIDENCE_RE = re.compile(r"\[ROW_ID\s*=\s*([A-Za-z0-9_\-]+)\]", re.IGNORECASE)
+
+
+def _has_row_id_evidence(text: str, notes: str, expected_prefix: str = "") -> bool:
+    """True iff text or notes contains a [ROW_ID=PREFIX-N] marker
+    (optionally narrowing to a specific prefix). The marker is the extractor's
+    own breadcrumb left by read_docx_blocks(); its presence is reliable
+    evidence that this id genuinely came from a structured table."""
+    if not text and not notes:
+        return False
+    combined = f"{text or ''} {notes or ''}"
+    for m in _ROW_ID_EVIDENCE_RE.finditer(combined):
+        val = m.group(1)
+        if not expected_prefix:
+            return True
+        if expected_prefix.upper() in val.upper():
+            return True
+    return False
 
 
 def _is_placeholder(x: Any) -> bool:
@@ -202,6 +285,145 @@ _BARE_NUMBER = re.compile(
     r"^[\d]+(\.\d+)?\s*(%|GB|MB|TB|GHz|MHz|V|W|A|mm|kg|lbs?|pcs?|ea)?$", re.IGNORECASE
 )
 
+# ── Phase 4: obvious-noise patterns ──────────────────────────────────────────
+# Each pattern is anchored ^...$ so it only triggers when the WHOLE text is
+# the noise — a real requirement that happens to contain a date/name as a
+# substring will NOT be caught.
+
+_PURE_DATE = re.compile(
+    r"^\s*(?:"
+    r"\d{1,2}[/\-.]\d{1,2}[/\-.]\d{2,4}"            # 5/5/26, 5-5-2026, 5.5.26
+    r"|\d{4}[/\-.]\d{1,2}[/\-.]\d{1,2}"             # 2026/05/05
+    r"|\d{1,2}[\s\-/](?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*[\s\-/]\d{2,4}"
+    r"|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2},?\s+\d{2,4}"
+    r")\s*$", re.IGNORECASE
+)
+
+_EMAIL_ONLY = re.compile(
+    r"^\s*[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\s*$"
+)
+
+# "Carty, Clark <ck@x.com>" — name + email-in-angle-brackets
+_CONTACT_WITH_EMAIL = re.compile(
+    r"^\s*[A-Z][A-Za-z\s,.\-']*?<\s*[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\s*>\s*$"
+)
+
+_TICK_OR_LABEL = re.compile(
+    r"^\s*(?:[✓✔✕✖✗✘×√]+"   # added √ (U+221A SQUARE ROOT) — common Asian-doc tick
+    r"|Y|N|YES|NO|N/A|NA|TBD|TBC|TBA|N\.A\.|NIL|Y/N|N/Y)\s*$",
+    re.IGNORECASE
+)
+
+# Single capitalized name, 1-2 title-case words, letters/hyphen only
+# Will catch "Bernd", "Jing Hui". Won't catch ALL-CAPS like "CPU" or numeric "8GB".
+_SINGLE_NAME = re.compile(
+    r"^\s*[A-Z][a-z]+(?:[\s\-][A-Z][a-z]+)?\s*$"
+)
+
+# 1-4 letter ALL-CAPS abbrev alone (HW, BMC, IT, BIOS)
+_UPPER_ABBREV = re.compile(r"^\s*[A-Z]{1,4}\s*$")
+
+# Revision/update log phrase (only triggers when text is short overall, see is_obvious_noise)
+_REVLOG_PATTERN = re.compile(
+    r"^\s*(?:"
+    r"(?:schedule|forecast|specification|spec|status|design|review|version|requirement)"
+    r"(?:\s*&\s*\w+)?\s+"
+    r"(?:updated|modified|approved|reviewed|locked|finalized|completed|added|removed|frozen)"
+    r"|(?:updated|modified|reviewed|approved|created)\s+by\s+"
+    r"|rev(?:ision)?\s*[:#]?\s*\d"
+    r"|owner\s*[:#]\s*[A-Z]"
+    r")", re.IGNORECASE
+)
+
+# Country + cert label, no verb (e.g. "Argentina S-Mark")
+_COUNTRY_CERT = re.compile(
+    r"^\s*(?:Argentina|Brazil|Mexico|China|India|Korea|Japan|Taiwan|USA|EU|UK|"
+    r"Germany|France|Australia|Canada|Russia|Israel|Singapore|Indonesia|Vietnam|Thailand)\s+"
+    r"(?:S-Mark|INMETRO|CCC|BIS|KC|VCCI|BSMI|FCC|CE|UL|RoHS|REACH|RCM|MIC|NCC)\s*$",
+    re.IGNORECASE
+)
+
+# Sub-item bullet marker at start (a/b/c, 1./2., i./ii., -, •)
+# The outer `\s+` handles the gap between marker and content, so the bullet
+# alternative itself must NOT also consume whitespace.
+_ORPHAN_MARKER = re.compile(
+    r"^\s*(?:"
+    r"\(?[a-z]\)"               # a), (a), (A)
+    r"|\d+[\.\)]"               # 1., 1)
+    r"|[ivxIVX]{1,4}\."         # ii., I.
+    r"|[\-•*◦●·]"               # -, •, ◦, ●, ·
+    r"|[a-z]\."                 # a., A.
+    r")\s+", re.IGNORECASE
+)
+
+
+def is_obvious_noise(text: str, notes: str = "") -> bool:
+    """Return True for text that is clearly NOT a requirement.
+
+    Conservative — every pattern is anchored to the WHOLE text, so a real
+    requirement that contains a date/name as a substring is preserved.
+
+    Items already classified as glossary/note via `notes` are exempted so
+    classify_item can route them to the right sheet.
+    """
+    n_upper = (notes or "").upper()
+    if "GLOSSARY" in n_upper or "DEFINITION" in n_upper or "RFP_PROCESS" in n_upper:
+        return False
+
+    t = (text or "").strip()
+    if not t:
+        return True
+
+    # 1. Pure date
+    if _PURE_DATE.match(t):
+        return True
+    # 2. Email-only or contact-with-email
+    if _EMAIL_ONLY.match(t) or _CONTACT_WITH_EMAIL.match(t):
+        return True
+    # 3. Tick / short label value (✓, Y/N, TBD, …)
+    if _TICK_OR_LABEL.match(t):
+        return True
+    # 4. ALL-CAPS abbrev alone (HW, BMC, …)
+    if _UPPER_ABBREV.match(t):
+        return True
+    # 5. Country + cert label only
+    if _COUNTRY_CERT.match(t):
+        return True
+    # 6. Revision / update log (only if text is short)
+    if len(re.findall(r"\w+", t)) <= 7 and _REVLOG_PATTERN.match(t):
+        return True
+    # 7. Single capitalized name (1-2 title-case words, no requirement verb)
+    if _SINGLE_NAME.match(t) and not _REQUIREMENT_VERBS.search(t):
+        return True
+
+    return False
+
+
+def is_likely_orphan_subitem(text: str, item_type: str, is_derived: bool) -> bool:
+    """Narrow detection: text starts with a/b/c/1./2./bullet marker AND
+    is short AND has no requirement verb.
+
+    Per Phase 4 spec: ONLY a/b/c-style sub-items missing parent context.
+    Not used for general junk — those are handled by is_obvious_noise.
+    """
+    if is_derived:
+        return False
+    if item_type != "requirement":
+        return False
+    t = (text or "").strip()
+    if not t:
+        return False
+    if not _ORPHAN_MARKER.match(t):
+        return False
+    word_count = len(re.findall(r"\w+", t))
+    # Numbered real requirement ("1. Memory shall be 8GB") has a verb → not orphan
+    if _REQUIREMENT_VERBS.search(t):
+        return False
+    # Full sentences (>8 words) without verb are also unlikely to be orphans
+    if word_count > 8:
+        return False
+    return True
+
 
 def is_junk_short(text: str) -> bool:
     """True if text is too short to be a real requirement and has no requirement verbs."""
@@ -247,15 +469,29 @@ def dedup_requirements(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 def filter_junk(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Remove items that are junk short values or standalone part numbers/spec values."""
+    """Remove items that are clearly not requirements:
+    - obvious noise (dates / contacts / names / symbols / revision-log / cert label / abbrev)
+    - junk-short text (< 3 words with no requirement verb)
+    - standalone part numbers / spec values
+
+    AUTO_SKIP-classified items (glossary by enricher) are exempted from the
+    new obvious-noise filter so the glossary sheet stays intact.
+    """
     out: List[Dict[str, Any]] = []
     removed_short = 0
     removed_pn = 0
+    removed_noise = 0
     for r in items:
         if r.get("derived_requirement"):
             out.append(r)
             continue
         text = (r.get("requirement") or "").strip()
+        notes = (r.get("notes") or "").strip()
+        status_u = str(r.get("status") or "").upper()
+
+        if status_u != "AUTO_SKIP" and is_obvious_noise(text, notes):
+            removed_noise += 1
+            continue
         if is_junk_short(text):
             removed_short += 1
             continue
@@ -263,8 +499,12 @@ def filter_junk(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             removed_pn += 1
             continue
         out.append(r)
-    if removed_short or removed_pn:
-        print(f"[POSTPROCESS] Filter: removed {removed_short} too-short, {removed_pn} part-number/spec ({len(out)} remaining)")
+    if removed_short or removed_pn or removed_noise:
+        print(
+            f"[POSTPROCESS] Filter: removed {removed_noise} obvious-noise, "
+            f"{removed_short} too-short, {removed_pn} part-number/spec "
+            f"({len(out)} remaining)"
+        )
     return out
 
 
@@ -291,6 +531,8 @@ _RISK_TAG_MAP = {
     "SECURITY_TPM_COMPLIANCE": "CERT",
     "SUBJECTIVE_ACCEPTANCE":   "ACCEPTANCE",
     "FIELD_SERVICE_IMPACT":    "SERVICEABILITY",
+    # Phase 4 orphan-subitem tag (passes through unchanged)
+    "ORPHAN_SUBITEM":          "ORPHAN_SUBITEM",
 }
 
 # Map long Chinese redflag messages (from redflags.yaml) to short tags
@@ -315,6 +557,7 @@ _RISK_NOTE_MAP = {
     "GLOSSARY":       "Definition/abbreviation — informational only",
     "ACCEPTANCE":     "Subjective acceptance criteria — clarify with customer",
     "SERVICEABILITY": "Field service impact — confirm replacement policy",
+    "ORPHAN_SUBITEM": "Possible orphan sub-item; verify parent context in original document",
 }
 
 # Category correction: keyword → canonical category
@@ -503,34 +746,96 @@ def auto_status(item_type: str, mlevel: str, redflags: List[str]) -> str:
     return "NEW"
 
 
-def ensure_req_id(r: Dict[str, Any], file_name: str, chunk: int) -> str:
-    """
-    Returns new_req_id.
+def ensure_req_id(
+    r: Dict[str, Any],
+    file_name: str,
+    chunk: int,
+    doc_schema: Optional[Dict[str, Any]] = None,
+) -> Tuple[str, str, str]:
+    """Resolve the final req_id with Phase 4 grounding validation.
 
-    Format:
-      RFQ table row : RFQ-{PREFIX}-{num:03d}  e.g. RFQ-BMC-001, RFQ-HOST-030
-      AI extracted  : AI-{seq:03d}             e.g. AI-001, AI-042
+    Returns (req_id, id_source, original_id) where id_source is:
+      - "original"  : id is backed by a trusted structured source
+                      (doc_schema.req_id_rule is structured) OR by a
+                      [ROW_ID=...] evidence marker in the chunk text.
+      - "generated" : no trustworthy id; fresh AI-<NNN>.
+
+    Output formats:
+      - RFQ-<PREFIX>-<NNN>  : trusted PREFIX-N table-row id  (IBM, ...)
+      - RFQ-<NNN>           : trusted numeric raw id from a structured source
+                              (Nokia simple_list xlsx ID column)
+      - RFQ-TBL-<NNN>       : trusted ROW_ID=N marker
+      - AI-<NNN>            : system-generated; covers LLM-hallucinated RFQ-*
+                              (HPE), unknown raw ids, and AUTO-* placeholders.
+
+    Special inputs:
+      __id_locked__=True  — outer split-pipe call already resolved this id;
+                            preserve to avoid re-validating slice text.
     """
+    # Pre-locked from outer split-pipe recursion: short-circuit
+    if r.get("__id_locked__"):
+        return (
+            str(r.get("req_id", "")),
+            str(r.get("__id_source__", "generated")),
+            str(r.get("__id_original__", r.get("req_id", ""))),
+        )
+
+    if doc_schema is None:
+        doc_schema = {}
+
     rid = r.get("req_id")
     rid_str = str(rid).strip() if rid is not None else ""
+    original_id = rid_str
+    text = r.get("requirement", "")
+    notes = r.get("notes", "")
 
-    # Case 1: original RFQ table ID (HOST-30, BMC-1, ROW_ID=2...)
+    file_rule = _file_req_id_rule(doc_schema, file_name)
+    is_structured = _is_structured_req_id_rule(file_rule)
+
+    # Case 1: raw RFQ table id  (HOST-30 / BMC-1 / ROW_ID=2)
     if rid_str and _is_rfq_table_id(rid_str):
         m = re.match(r"^([A-Za-z_]+)-(\d+)$", rid_str)
         if m:
-            return f"RFQ-{m.group(1).upper()}-{int(m.group(2)):03d}"
+            prefix, num = m.group(1), m.group(2)
+            if is_structured or _has_row_id_evidence(text, notes, prefix):
+                return (f"RFQ-{prefix.upper()}-{int(num):03d}", "original", original_id)
+            return (_next_ai_id(), "generated", original_id)
         m2 = re.match(r"^ROW_ID=(\d+)$", rid_str)
         if m2:
-            return f"RFQ-TBL-{int(m2.group(1)):03d}"
-        return f"RFQ-{rid_str}"
+            if is_structured or _has_row_id_evidence(text, notes, ""):
+                return (f"RFQ-TBL-{int(m2.group(1)):03d}", "original", original_id)
+            return (_next_ai_id(), "generated", original_id)
+        if is_structured:
+            return (f"RFQ-{rid_str}", "original", original_id)
+        return (_next_ai_id(), "generated", original_id)
 
-    # Case 2: already clean new-format ID — keep it
-    if rid_str.startswith("RFQ-") or re.match(r'^AI-\d{3}', rid_str):
-        return rid_str
+    # Case 2a: pre-formatted RFQ-PREFIX-NNN  (letter-prefix form, with optional suffix)
+    if rid_str.startswith("RFQ-"):
+        m_letter = re.match(r"^RFQ-([A-Za-z_]+)-\d+(?:-[a-z0-9]+)?$", rid_str)
+        if m_letter:
+            prefix = m_letter.group(1)
+            if is_structured or _has_row_id_evidence(text, notes, prefix):
+                return (rid_str, "original", original_id)
+            return (_next_ai_id(), "generated", original_id)
+        # Numeric form RFQ-NNN  (with optional suffix) — only valid if structured
+        m_num = re.match(r"^RFQ-\d+(?:-[a-z0-9]+)?$", rid_str)
+        if m_num:
+            if is_structured:
+                return (rid_str, "original", original_id)
+            return (_next_ai_id(), "generated", original_id)
+        # Unparseable RFQ-* — preserve cautiously
+        return (rid_str, "original", original_id)
 
-    # Case 3: everything else (AUTO-*, old AI-1-001, empty, unknown) → new AI-XXX
-    _AI_SEQ["n"] += 1
-    return f"AI-{_AI_SEQ['n']:03d}"
+    # Case 2b: existing AI-NNN[-suffix]  →  keep as generated
+    if re.match(r"^AI-\d+(?:-[a-z0-9]+)?$", rid_str):
+        return (rid_str, "generated", original_id)
+
+    # Case 2.5: structured numeric raw id  (Nokia simple_list xlsx ID column: "1" → RFQ-001)
+    if rid_str and is_structured and rid_str.isdigit():
+        return (f"RFQ-{int(rid_str):03d}", "original", original_id)
+
+    # Case 3: AUTO-* / empty / unknown / unstructured-non-PREFIX → fresh AI-<NNN>
+    return (_next_ai_id(), "generated", original_id)
 
 
 def is_enriched_item(r: Dict[str, Any]) -> bool:
@@ -551,8 +856,10 @@ def flatten_redflags(r: Dict[str, Any]) -> List[str]:
     return tags
 
 
-def build_rows(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def build_rows(items: List[Dict[str, Any]], doc_schema: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
+    if doc_schema is None:
+        doc_schema = {}
 
     for r in items:
         src = r.get("source", {}) or {}
@@ -566,14 +873,21 @@ def build_rows(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         # Split pipe rows
         parts = split_pipe_requirement(text)
         if len(parts) > 1:
-            base_id = ensure_req_id(r, f, c)
+            # Resolve once for the parent row; recursion sees __id_locked__
+            # and skips re-validation against the (smaller) slice text.
+            base_id, base_id_src, base_orig = ensure_req_id(
+                r, f, c, doc_schema=doc_schema
+            )
             for idx, p in enumerate(parts):
                 rr = dict(r)
                 rr["requirement"] = p
                 suffix = chr(ord("a") + idx) if idx < 26 else str(idx + 1)
                 rr["req_id"] = f"{base_id}-{suffix}"
+                rr["__id_locked__"]   = True
+                rr["__id_source__"]   = base_id_src
+                rr["__id_original__"] = (f"{base_orig}-{suffix}" if base_orig else rr["req_id"])
                 rr["notes"] = (notes + " | SPLIT_FROM_PIPE").strip(" |")
-                rows.extend(build_rows([rr]))
+                rows.extend(build_rows([rr], doc_schema=doc_schema))
             continue
 
         is_derived = bool(r.get("derived_requirement"))
@@ -586,7 +900,11 @@ def build_rows(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         has_rf = bool(redflag_val and str(redflag_val) not in ("[]", ""))
 
         if item_type in ("note", "junk"):
-            if must_level_val in ("MUST", "SHOULD", "MAY"):
+            # Phase 4 guard: obvious-noise text is never promoted to requirement,
+            # even if upstream LLM enrichment marked it MUST/SHOULD/MAY.
+            if is_obvious_noise(text, notes):
+                item_type = "junk"
+            elif must_level_val in ("MUST", "SHOULD", "MAY"):
                 item_type = "requirement"
             elif status_val == "NEED_REVIEW":
                 item_type = "requirement"
@@ -625,6 +943,14 @@ def build_rows(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             status = auto_status(item_type, mlevel, redflags)
             raw_rf = redflags
 
+        # Phase 4: narrow orphan-subitem detection (a/b/c bullet without parent context)
+        if is_likely_orphan_subitem(text, item_type, is_derived):
+            if "ORPHAN_SUBITEM" not in raw_rf:
+                raw_rf.append("ORPHAN_SUBITEM")
+            status = "NEED_REVIEW"
+            if not next_action:
+                next_action = "Verify parent context — read source document"
+
         # ── Normalize ──
         category = normalize_category(category, text)
         risk_tags, risk_note = normalize_risk_flags(raw_rf)
@@ -632,7 +958,9 @@ def build_rows(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         evidence = clean_llm_text(evidence)
         next_action = clean_llm_text(next_action)
 
-        rid = ensure_req_id(r, f, c)
+        rid, id_source, original_id = ensure_req_id(
+            r, f, c, doc_schema=doc_schema
+        )
         sheet = src.get("sheet", "")
         row = src.get("row")
         fname = re.sub(r'\.(docx|doc|xlsx|xls|pdf|txt|md)$', '', Path(f).name, flags=re.IGNORECASE)
@@ -676,6 +1004,8 @@ def build_rows(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "_orig_req_id": r.get("req_id", ""),
             "_type": item_type,
             "_derived": is_derived,
+            "_id_source": id_source,
+            "_original_id": original_id,
         })
 
     return rows
@@ -708,8 +1038,16 @@ def main():
     reqs = filter_junk(reqs)
     print(f"[POSTPROCESS] After cleaning: {len(reqs)} requirements")
 
+    # Phase 4: load doc_schema so ensure_req_id can validate RFQ-* claims.
+    # When missing/unreadable an empty dict is returned — every RFQ-* claim
+    # then defaults to "untrusted" and is demoted to AI-<NNN>.
+    doc_schema = load_doc_schema(in_path)
+    _ds_rule = (doc_schema or {}).get("req_id_rule", "")
+    _ds_files = len((doc_schema or {}).get("files") or [])
+    print(f"[POSTPROCESS] doc_schema loaded: req_id_rule={_ds_rule!r} files={_ds_files}")
+
     _reset_ai_seq()
-    rows = build_rows(reqs)
+    rows = build_rows(reqs, doc_schema=doc_schema)
 
     cols = [
         "Req ID", "重要程度 (Must Level)", "Category", "Owner", "Stakeholder", "Status",
@@ -806,13 +1144,15 @@ def main():
         "items": []
     }
 
-    _export_cols = [c for c in cols + ["_type", "_orig_req_id", "_derived"] if c in df.columns]
+    _export_cols = [c for c in cols + ["_type", "_orig_req_id", "_derived", "_id_source", "_original_id"] if c in df.columns]
     for r in df.reindex(columns=_export_cols, fill_value="").to_dict(orient="records"):
         _rf_raw = r.get("Risk Flags / 風險標記") or ""
         _rf_list = [t.strip() for t in _rf_raw.split(",") if t.strip()] if _rf_raw else []
         clean["items"].append({
             "req_id":        r["Req ID"],
             "orig_req_id":   r.get("_orig_req_id", ""),
+            "original_id":   r.get("_original_id", ""),
+            "id_source":     r.get("_id_source", "unknown"),
             "type":          r.get("_type", ""),
             "must_level":    r.get("重要程度 (Must Level)", ""),
             "category":      r.get("Category", ""),
@@ -826,6 +1166,13 @@ def main():
             "next_action":   r.get("Next Action", ""),
             "source":        r.get("Source", ""),
             "derived":       bool(r.get("_derived", False)),
+            # ── Phase 4.6 normalization fields (filled by
+            # scripts/normalize_requirements_llm.py; empty defaults keep the
+            # clean.json schema consistent across all cases). ──
+            "normalized_requirement": "",
+            "rewrite_reason":         "",
+            "rewrite_confidence":     0.0,
+            "needs_rewrite_review":   False,
         })
 
     clean_path = out_dir / "requirements_clean.json"

@@ -37,6 +37,7 @@ sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 from llm_client import get_client, get_model, is_available, parse_json_response
+from file_selection import load_excluded   # Phase 7: enforce Step 1.5 exclusion
 
 try:
     import docx  # python-docx
@@ -1169,11 +1170,18 @@ def call_llm_json_with_retry(client: OpenAI, model: str, prompt: str, retries: i
 # -----------------------------
 # Resume / partial jsonl
 # -----------------------------
-def load_done_keys(partial_path: Path) -> Tuple[Set[Tuple[str, int]], List[Dict[str, Any]]]:
+def load_done_keys(partial_path: Path,
+                   include_failed_as_done: bool = True
+                   ) -> Tuple[Set[Tuple[str, int]], List[Dict[str, Any]]]:
     """
     Read jsonl and return:
     - done keys: {(file, chunk)}
     - flattened requirements list (dedup later)
+
+    Phase 4.6G: records carrying failed_chunk=true are normally treated as
+    done (so resume skips them like any other completed chunk). Pass
+    include_failed_as_done=False to make resume re-attempt them — the caller
+    wires this to --retry-failed-chunks.
     """
     done: Set[Tuple[str, int]] = set()
     reqs_all: List[Dict[str, Any]] = []
@@ -1191,8 +1199,10 @@ def load_done_keys(partial_path: Path) -> Tuple[Set[Tuple[str, int]], List[Dict[
 
         f = obj.get("file")
         c = obj.get("chunk")
+        is_failed = bool(obj.get("failed_chunk", False))
         if f and isinstance(c, int):
-            done.add((f, c))
+            if not (is_failed and not include_failed_as_done):
+                done.add((f, c))
 
         rs = obj.get("requirements") or []
         if isinstance(rs, list):
@@ -1201,10 +1211,38 @@ def load_done_keys(partial_path: Path) -> Tuple[Set[Tuple[str, int]], List[Dict[
     return done, reqs_all
 
 
-def append_partial(partial_path: Path, file_name: str, chunk_index: int, requirements: List[Dict[str, Any]]) -> None:
+def append_partial(partial_path: Path, file_name: str, chunk_index: int,
+                   requirements: List[Dict[str, Any]],
+                   failed: bool = False) -> None:
+    """Append one chunk's outcome to partial.jsonl. Phase 4.6G adds the
+    `failed` flag: when True, the record carries `failed_chunk=true` so
+    load_done_keys can tell a legit empty-requirements chunk apart from a
+    chunk we gave up on after retry exhaust."""
     partial_path.parent.mkdir(parents=True, exist_ok=True)
     rec = {"file": file_name, "chunk": chunk_index, "requirements": requirements}
+    if failed:
+        rec["failed_chunk"] = True
     with partial_path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+
+def _append_extract_error(errors_path: Path, file_name: str, chunk_index: int,
+                          total: int, error: str, model: str,
+                          chunk_chars: int) -> None:
+    """Phase 4.6G — append a record describing a chunk we gave up on after
+    retry exhaust. Each line is one independent failure event; the file is
+    append-only across runs so PMs can see history."""
+    errors_path.parent.mkdir(parents=True, exist_ok=True)
+    rec = {
+        "file":        file_name,
+        "chunk":       chunk_index,
+        "total":       total,
+        "error":       error,
+        "model":       model,
+        "ts":          now_iso(),
+        "chunk_chars": chunk_chars,
+    }
+    with errors_path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
 
@@ -1243,6 +1281,19 @@ def main():
     ap.add_argument("--resume", action="store_true", help="Resume from partial jsonl if exists")
     ap.add_argument("--reset-partial", action="store_true", help="Delete partial jsonl and rerun cleanly")
     ap.add_argument("--retries", type=int, default=3, help="LLM retries for each chunk")
+    # Phase 4.6G — bad chunk soft-fail + threshold gate
+    ap.add_argument("--max-failed-chunks", type=int, default=20,
+                    help="Abort extract if absolute count of failed chunks in this run "
+                         "exceeds this. 0 = abort on the first failure.")
+    ap.add_argument("--max-failed-pct", type=float, default=5.0,
+                    help="Abort extract if failed_chunks / attempted_chunks in this run "
+                         "exceeds this percentage. attempted_chunks excludes resume-skipped.")
+    ap.add_argument("--min-attempted-for-pct", type=int, default=50,
+                    help="Disable --max-failed-pct gate until this many chunks attempted "
+                         "in this run. Avoids tripping on small-sample noise.")
+    ap.add_argument("--retry-failed-chunks", action="store_true",
+                    help="On resume, re-attempt chunks previously marked failed_chunk=true. "
+                         "Default: skip them like any other completed chunk.")
     args = ap.parse_args()
 
     if not is_available():
@@ -1281,11 +1332,37 @@ def main():
         partial_path.unlink()
         print(f"[OK] Deleted partial: {partial_path}")
 
+    # Phase 7: load Step 1.5 exclusion set early so we can also scrub any stale
+    # partial.jsonl entries that were written before the file was excluded.
+    excluded_files = load_excluded(case_dir)
+    if excluded_files:
+        print(f"[INFO] Step 1.5: {len(excluded_files)} file(s) marked excluded: "
+              f"{sorted(excluded_files)}")
+
     done_keys: Set[Tuple[str, int]] = set()
     all_reqs: List[Dict[str, Any]] = []
 
+    # Phase 4.6G — bad chunk soft-fail bookkeeping
+    failed_chunks: List[Dict[str, Any]] = []
+    attempted_chunks: int = 0
+    errors_path: Path = out_dir / "extract_errors.jsonl"
+
     if args.resume and partial_path.exists():
-        done_keys, partial_reqs = load_done_keys(partial_path)
+        done_keys, partial_reqs = load_done_keys(
+            partial_path,
+            include_failed_as_done=not args.retry_failed_chunks,
+        )
+        if excluded_files:
+            _orig_partial = len(partial_reqs)
+            partial_reqs = [
+                r for r in partial_reqs
+                if str((r.get("source") or {}).get("file", "")) not in excluded_files
+            ]
+            done_keys = {k for k in done_keys if k[0] not in excluded_files}
+            _dropped_partial = _orig_partial - len(partial_reqs)
+            if _dropped_partial > 0:
+                print(f"[INFO] Step 1.5: dropped {_dropped_partial} stale partial req(s) "
+                      "from now-excluded file(s)")
         all_reqs.extend(partial_reqs)
         print(f"[OK] Resume enabled. Loaded done chunks: {len(done_keys)}; partial reqs: {len(partial_reqs)}")
 
@@ -1329,6 +1406,19 @@ def main():
         files.extend(sorted(rfq_dir.glob(ext)))
     if not files:
         raise FileNotFoundError(f"No supported files found in: {rfq_dir} (docx/doc/xlsx/xls/pdf/md/txt)")
+
+    # Phase 7: filter out files the PM marked Include=False in Step 1.5
+    if excluded_files:
+        _dropped_files = [fp.name for fp in files if fp.name in excluded_files]
+        files = [fp for fp in files if fp.name not in excluded_files]
+        if _dropped_files:
+            print(f"[INFO] Step 1.5: skipping {len(_dropped_files)} excluded file(s): {_dropped_files}")
+        if not files:
+            raise FileNotFoundError(
+                f"All input files in {rfq_dir} were marked Include=False in Step 1.5. "
+                f"Re-enable some files via the UI (Step 1.5 → Save Selection) or "
+                f"edit inbound/<case>/meta/file_selection.json directly."
+            )
 
     for fp in files:
         name = fp.name
@@ -1403,8 +1493,36 @@ def main():
                 continue
 
             print(f"[PROGRESS] {name} chunk {i}/{len(chunks)}")
+            attempted_chunks += 1
             prompt = build_prompt(name, i, chunk, doc_schema=file_schema or doc_schema)
-            data = call_llm_json_with_retry(client, args.model, prompt, retries=args.retries)
+
+            try:
+                data = call_llm_json_with_retry(client, args.model, prompt, retries=args.retries)
+            except RuntimeError as _e:
+                # Phase 4.6G — bad chunk soft-fail: record, mark, continue.
+                err_short = str(_e).encode("ascii", errors="replace").decode("ascii")[:500]
+                print(f"[WARN] Skipping {name} chunk {i}/{len(chunks)} after retry exhaust: "
+                      f"{err_short[:120]}")
+                _append_extract_error(errors_path, name, i, len(chunks),
+                                      err_short, args.model, len(chunk))
+                append_partial(partial_path, name, i, [], failed=True)
+                failed_chunks.append({"file": name, "chunk": i})
+
+                # Threshold gate — abort if this run's failures look systemic.
+                fail_pct = 100.0 * len(failed_chunks) / max(attempted_chunks, 1)
+                abort_by_abs = len(failed_chunks) > args.max_failed_chunks
+                abort_by_pct = (attempted_chunks >= args.min_attempted_for_pct
+                                and fail_pct > args.max_failed_pct)
+                if abort_by_abs or abort_by_pct:
+                    raise RuntimeError(
+                        f"Aborting extract: {len(failed_chunks)} failed chunk(s) "
+                        f"({fail_pct:.1f}% of {attempted_chunks} attempted) "
+                        f"exceeds threshold "
+                        f"(max={args.max_failed_chunks}, max_pct={args.max_failed_pct}%, "
+                        f"min_attempted_for_pct={args.min_attempted_for_pct}). "
+                        f"See {errors_path} for details."
+                    )
+                continue
 
             reqs = data.get("requirements", []) or []
 
@@ -1545,8 +1663,15 @@ def main():
     out_path = out_dir / "requirements.json"
     out_path.write_text(json.dumps(req_doc, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"[OK] Output: {out_path}")
-    print(f"[OK] Requirements count: {len(all_reqs)}")
+    if failed_chunks:
+        print(f"[OK] Requirements count: {len(all_reqs)} "
+              f"(skipped {len(failed_chunks)} chunk(s))")
+    else:
+        print(f"[OK] Requirements count: {len(all_reqs)}")
     print(f"[OK] Partial saved: {partial_path}")
+    if failed_chunks:
+        print(f"[WARN] {len(failed_chunks)} chunk(s) failed extraction; "
+              f"see {errors_path}")
 
 
 if __name__ == "__main__":

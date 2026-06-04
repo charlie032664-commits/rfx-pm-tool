@@ -351,3 +351,518 @@ When `items` is empty after filtering `AUTO_SKIP`:
   without explicit shall/must requirements.
   You can still download the empty templates from Step 3 above.
 ```
+
+---
+
+## Phase 4.6 — Optional Normalization Fields
+
+Added by `scripts/normalize_requirements_llm.py` (Phase 4.6A prototype).
+These fields are populated only when the normalization script is run for a
+case; they exist as empty defaults on every `items[]` entry produced by
+`postprocess_requirements.py` so the JSON schema stays uniform.
+
+| Field | Type | Required | Description | Values |
+|-------|------|----------|-------------|--------|
+| `normalized_requirement` | string | Y | LLM-rewritten standalone form of the requirement, with the same constraints (no new numbers/units/standards beyond original + notes + source). Empty when no rewrite was needed or attempted. | — |
+| `rewrite_reason` | string | Y | Why the normalization produced what it did. | `""` (empty = never run) · `already_complete` · `fragment_to_standalone` · `qa_answer_to_requirement` · `ambiguous_needs_review` · `no_rewrite` · `not_attempted` |
+| `rewrite_confidence` | float | Y | LLM-reported confidence, then optionally capped at 0.5 by the lexical audit if hallucinated tokens were detected. | `0.0`–`1.0` |
+| `needs_rewrite_review` | boolean | Y | True when PM should manually verify the normalized text. Set when the LLM self-reports ambiguity, the audit detects new tokens, or the call failed. | `true` / `false` |
+
+**Hard invariants (the script asserts these):**
+- `requirement` (the Original text) is never modified.
+- `req_id` is never changed.
+- `responses.json` is never touched.
+- The script is idempotent: rows with `rewrite_reason` set to anything other
+  than `""` or `"not_attempted"` are skipped unless `--force`.
+
+**Audit guard.** If the normalized text contains numbers, units, version
+codes, model codes, or standards (e.g., `16GB`, `DDR5`, `PCIe 4.0`, `FCC`,
+`TPM 2.0`) that are not present in the original / notes / source pool, the
+script forces `needs_rewrite_review=true` and caps `rewrite_confidence` at
+`0.5`. The original requirement remains the authoritative reference.
+
+---
+
+## Phase 4.6E — PM Final Requirement & Exclude
+
+### responses.json — three new fields (Phase 4.6E.1)
+
+PM edits captured in Step 4: Review & Fill are persisted into
+`responses/<case>/responses.json` keyed by `req_id`. Phase 4.6E.1 added three
+new fields alongside the existing `status` / `vendor_comment` / `evidence` /
+`gap` / `ai_draft` / `updated_at`:
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `final_requirement` | string | `""` | PM-edited final wording. Empty means PM has not overridden, so the export's "Requirement (Final)" column falls through to `normalized_requirement` or the original `requirement`. |
+| `exclude_from_matrix` | bool | `false` | True = PM has decided this row should NOT appear in the customer-facing Compliance Matrix. Routes the row into the Excluded sheet instead. |
+| `exclude_reason` | string | `""` | Free-text reason for the exclusion. Always saved (so toggling Exclude off and back on restores the reason). Surfaces in the Excluded sheet's "Gap / Notes" column. |
+
+The Step 4 UI shows a `[EXCLUDED]` tag on the expander label when
+`exclude_from_matrix` is true, and the Status filter dropdown includes an
+"Excluded" option that lists only PM-excluded rows.
+
+### compliance_matrix.xlsx — Requirement (Final) column + Excluded sheet (Phase 4.6E.2)
+
+#### HEADERS — 16 → 17 columns
+
+A new **"Requirement (Final)"** column is inserted at position 7, between
+"Compliance Status" and "Requirement (Original)". The fallback chain that
+populates it is:
+
+1. `responses[req_id].final_requirement` (non-empty after `.strip()`) → use PM edit
+2. `item.normalized_requirement` (non-empty) → use LLM-normalized text
+3. `item.requirement` → use the original extraction
+
+The Original column is never mutated — it remains the source of truth.
+
+#### New "Excluded" sheet
+
+Placed after `Skipped` (position 12 overall). Schema is **uniform with every
+other data sheet** (17 columns). The `exclude_reason` is **not** a separate
+column; instead it is prefixed onto the Gap / Notes column for rows in this
+sheet:
+
+- With reason: `[EXCLUDED: <reason>] <original gap text>`
+- Without reason: `[EXCLUDED]`
+
+The prefix is applied once during response merge (re-running export reads
+fresh values from responses.json, so the tag does not accumulate).
+
+#### Routing precedence in `split_sheets()`
+
+PM exclude beats all other routing — even if a row would otherwise have been
+classified as glossary / note / junk / AUTO_SKIP, an explicit
+`exclude_from_matrix=true` sends it to the Excluded sheet:
+
+```
+0. exclude_from_matrix == true → Excluded   ← Phase 4.6E.2
+1. type == "glossary" OR risk_tags ⊇ {GLOSSARY} → Glossary
+2. type == "note"                              → Notes
+3. type == "junk" OR status == "AUTO_SKIP"     → Skipped
+4. (everything else)                            → Compliance Matrix (main)
+```
+
+#### Row-count invariants
+
+- `Compliance Matrix rows == Σ(3. Hardware ... 8. Others rows)` — both
+  derived from `main_reqs` which has PM-excluded items already removed.
+- `By_Category_Summary` Total row equals `Compliance Matrix rows` — Summary
+  is built from the same `main_reqs` and therefore does NOT count excluded.
+- `Excluded sheet rows == count(responses where exclude_from_matrix=true)` —
+  the Excluded sheet is a 1:1 reflection of PM decisions.
+
+#### Backward compatibility
+
+- Old `responses.json` files without these fields: all three default to
+  empty / false, so behaviour is unchanged.
+- Cases that have never run Step 3.5 Normalize: `normalized_requirement` is
+  empty, so "Requirement (Final)" falls through to Original.
+- Excluded sheet is present even when empty (header row only), so the
+  workbook schema is consistent across cases.
+
+---
+
+## Phase 4.6D — Pipeline lock file (advisory)
+
+A case-level advisory lock prevents two Streamlit sessions from mutating
+the same case at the same time. The lock is purely cooperative — it has
+no kernel-level enforcement; it works because every entry point in
+`app.py` consults `read_lock_info()` before running.
+
+### Path
+
+```
+runs/<case_id>/.pipeline.lock
+```
+
+Excluded from version control (`runs/` is in `.gitignore`).
+
+### Schema
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `case_id` | string | — | Echo of the case ID for sanity checks. |
+| `started_at` | ISO 8601 string | — | When `acquire_lock()` ran. Drives the 2 h stale rule. |
+| `pid` | int | — | Acquiring process's PID. Informational; PID liveness does **not** override the stale rule. |
+| `host` | string | — | `socket.gethostname()` at acquire time. Informational. |
+| `user` | string | — | `getpass.getuser()` at acquire time. Informational. |
+| `start_step` | int | — | Pipeline step index the run began from (0 = full pipeline, 1 = enrich+format+export, 0 also for normalize). Insufficient on its own to distinguish run types — see `operation`. |
+| `operation` | string | `"unknown"` | **Phase 4.6D**. What kind of run is holding the lock. See allowed values below. |
+
+### `operation` allowed values
+
+| Value | Meaning | Acquired by |
+|-------|---------|-------------|
+| `"pipeline"` | Full Pipeline or Enrich+Format+Export is running. | Phase 2 — Run Full Pipeline / ⚡ Enrich + Format + Export |
+| `"normalize"` | Step 3.5 Normalize is running. | Step 3.5 — Run Normalize |
+| `"unknown"` | Anything else (caller did not specify, or specified an unrecognized value, or it is an old lock file from before Phase 4.6D). | Fallback in `acquire_lock()` |
+
+`acquire_lock(case_id, start_step, operation=...)` normalizes any
+unrecognized string (`None`, `""`, typos, future values) to `"unknown"`
+so a typo in a future caller cannot corrupt the schema.
+
+### UI rendering (Phase 4.6D)
+
+The active-lock banner under Step 2 picks a headline by `operation`:
+
+| `operation` | Headline shown to PM |
+|-------------|----------------------|
+| `"pipeline"` | `🔒 This case is currently locked by a pipeline run.` |
+| `"normalize"` | `🔒 This case is currently locked by a normalize run.` |
+| `"unknown"` or missing | `🔒 This case is currently locked by another session.` |
+
+Both the active-lock banner and the stale-lock banner additionally
+display `operation:` in their metadata line so debugging is easy when a
+lock looks suspicious.
+
+### Stale rule (unchanged)
+
+A lock is **stale** when *any* of the following is true:
+
+- The file is unparseable (invalid JSON / non-object).
+- `started_at` is missing or unparseable.
+- `now - started_at > 2 hours` (`PIPELINE_LOCK_STALE_HOURS`).
+
+PID liveness is **not** consulted by the stale rule — it appears in the
+banner as a hint only. Phase 4.6D does not change this.
+
+### Backward compatibility
+
+- Lock files written before Phase 4.6D have no `operation` field.
+  `read_lock_info()` parses them unchanged; the UI falls back to the
+  "another session" headline and shows `operation: unknown` in the
+  metadata line.
+- All callers explicitly pass `operation=` after Phase 4.6D, so freshly
+  written lock files always carry the field.
+- The stale rule is identical, so any operational tooling that checks
+  age continues to work.
+
+---
+
+## Phase 4.6F — Progress log contract (UI streaming)
+
+Phase 4.6F.1 introduces live progress widgets in **Step 2** (Full Pipeline
+/ Enrich+Format+Export) and **Step 3.5** (Normalize). The widgets are
+driven by parsing each subprocess's stdout line by line. The format below
+is the contract between the scripts that produce these lines and the UI
+parser in `app.py` (`_parse_progress_line`).
+
+### Recognized event lines
+
+| Line shape | Emitted by | UI effect |
+|---|---|---|
+| `[INFO] <file>: <N> chunks` | `extract_requirements_llm.py` per file | Reset chunk slot to `0 / N`, set current file |
+| `[PROGRESS] <file> chunk <i>/<N>` | `extract_requirements_llm.py` before each chunk's LLM call | Advance chunk slot to `i / N`; recompute ETA |
+| `[SKIP] <file> chunk <i>/<N> already done` | `extract_requirements_llm.py` resume path | Same as `[PROGRESS]` — advances counter |
+| `  [<i>/<N>] <req_id> …` | `normalize_requirements_llm.py` per item | Advance item slot to `i / N · req_id` |
+| `[PROGRESS] enrich item <i>/<N> req_id=<id>` | `run_case.py` per item | Advance item slot to `i / N · req_id` |
+| `[WARN] LLM call failed (attempt <i>/<N>) … -> sleep <s>s` | `extract_requirements_llm.py` retry | Show retry warning |
+| `[WARN] LLM enrich attempt <i>/<N> … -> sleep <s>s` | `run_case.py` retry | Show retry warning |
+
+Any line that doesn't match any pattern is appended to the per-step log
+expander unchanged. A step that emits **no** events still works — the
+UI shows the spinner, an "elapsed: 0s (running…)" placeholder, and the
+full log on completion.
+
+### Buffering
+
+`run_step_streaming()` injects `PYTHONUNBUFFERED=1` into the subprocess
+environment so Python's stdout flushes line by line into the pipe.
+Scripts therefore do **not** need `flush=True` on individual `print()`
+calls; the existing prints stream as-is.
+
+### Stderr
+
+The streaming runner merges `stderr` into `stdout`
+(`stderr=subprocess.STDOUT`), so `[WARN]` retry lines arrive in the same
+event stream and are parsed alongside `[PROGRESS]` lines.
+
+### ETA
+
+ETA is computed as `elapsed × (total − done) / done`. It is shown only
+when `done ≥ 2` and `done < total`, and is labelled "(rough)" — chunk
+sizes are uneven, retry sleeps distort the rate, and the linear
+extrapolation does not model these. Requiring `done ≥ 2` dampens the
+wildly misleading first-sample ETA that a single warm-up call would
+produce.
+
+### Scope of Phase 4.6F.1
+
+**In scope:**
+- Streaming infrastructure (`run_step_streaming`)
+- Extract chunk progress
+- Normalize per-item progress
+- LLM retry warning surface
+
+**Out of scope:**
+- Persisted run history / per-run timeline export
+
+---
+
+## Phase 4.6G — Bad chunk soft-fail
+
+Before Phase 4.6G a single chunk that the LLM could not return parseable
+JSON for (after the built-in 3 retries) would `raise RuntimeError`,
+exiting the extract subprocess and stopping the whole pipeline. For very
+large documents (e.g. a 2979-chunk specification) one unlucky chunk was
+enough to block the entire case, because the failure was deterministic
+on resume — same chunk text + same model = same parse failure.
+
+Phase 4.6G changes the chunk loop so that retry-exhausted chunks are
+**recorded and skipped**, with a threshold gate that still aborts when
+failures look systemic.
+
+### `runs/<case>/extract_errors.jsonl`
+
+Append-only across runs (history of every soft-failed chunk). One JSON
+object per line:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `file` | string | Source filename whose chunk failed (matches `requirements.partial.jsonl`'s `file`). |
+| `chunk` | int | 1-indexed chunk number within `file`. |
+| `total` | int | Total chunks in `file` at the time of failure. Useful when chunk counts change between runs. |
+| `error` | string | First 500 chars (ASCII-replace) of the `RuntimeError` raised by `call_llm_json_with_retry`. Typically includes a preview of the raw LLM response. |
+| `model` | string | `args.model` at the time of failure (matches the model name in `runs/_debug/llm_raw_*.txt` filenames). |
+| `ts` | ISO 8601 string | `now_iso()` at the time the soft-fail was recorded. |
+| `chunk_chars` | int | `len(chunk)` — useful for spotting "always the long chunks" patterns. |
+
+### `requirements.partial.jsonl` — new optional `failed_chunk` field
+
+Records written by `append_partial(..., failed=True)` carry an extra
+`"failed_chunk": true` field. The `requirements` array is empty (`[]`).
+A legitimately empty chunk (e.g. boilerplate, signature page) is also
+written with `requirements: []` but **without** the `failed_chunk` field,
+so the two cases are distinguishable.
+
+### Threshold gate (CLI flags on `scripts/extract_requirements_llm.py`)
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--max-failed-chunks` | `20` | Abort the run if the absolute count of failed chunks in this run exceeds this. `0` aborts on the first failure. |
+| `--max-failed-pct` | `5.0` | Abort if `failed_chunks / attempted_chunks` in this run exceeds this percentage. Only applies once `--min-attempted-for-pct` chunks have been attempted. |
+| `--min-attempted-for-pct` | `50` | Disable the `--max-failed-pct` gate until this many chunks have been attempted in this run. Prevents small-sample noise (e.g. `1/16 = 6.25%`) from tripping the gate. |
+| `--retry-failed-chunks` | off | On resume, re-attempt chunks previously marked `failed_chunk=true`. Default: skip them like any other completed chunk. |
+
+`attempted_chunks` excludes resume-skipped chunks — only chunks that
+went through `call_llm_json_with_retry` in this run count.
+
+The gate uses an OR: either an absolute-count overflow or a percentage
+overflow aborts. When the gate trips, the run still raises
+`RuntimeError`, but the failed chunks that have already been recorded
+(in `extract_errors.jsonl` and as `failed_chunk=true` rows in
+`partial.jsonl`) remain on disk for inspection.
+
+### Resume behavior
+
+| Scenario | `failed_chunk=true` row in partial | Behavior |
+|----------|------------------------------------|----------|
+| Default resume | yes | Treated as done — re-run skips the chunk. |
+| `--retry-failed-chunks` | yes | Removed from `done_keys` — re-run re-attempts the chunk. If it fails again, a new `extract_errors.jsonl` row is appended (history is preserved). |
+| Legitimately empty chunk (no `failed_chunk` field) | no | Treated as done in both modes — never re-attempted. |
+
+### UI surfacing (Streamlit)
+
+- `extract_errors.jsonl` appears in **Step 3 → Advanced Outputs** alongside the other intermediate artifacts.
+- When `extract_errors.jsonl` exists with one or more rows, **Step 3** shows a yellow warning banner above the download cards with the count and instructions for retry.
+
+### End-of-run stdout
+
+The extract script prints a summary line that the UI streams through
+verbatim:
+
+```
+[OK] Output: runs/<case>/requirements.json
+[OK] Requirements count: <N> (skipped <K> chunk(s))   ← parenthetical only when K > 0
+[OK] Partial saved: runs/<case>/requirements.partial.jsonl
+[WARN] <K> chunk(s) failed extraction; see runs/<case>/extract_errors.jsonl   ← only when K > 0
+```
+
+---
+
+## Phase 4.6I — Cancel / interrupt button
+
+Long extract runs on big documents (a 2979-chunk spec, an LLM provider
+that is timing out, etc.) used to require the PM to find and `taskkill`
+the Python subprocess by hand. Phase 4.6I exposes a **Cancel** button in
+the UI that kills the running subprocess, cleans up the lock, and
+preserves all partial outputs.
+
+### Subprocess PID sidecar — `runs/<case_id>/.pipeline.subproc_pid`
+
+A short-lived companion to `.pipeline.lock`. Contains a single line: the
+PID of the currently-running extract / enrich / normalize child.
+
+- **Written** by `run_step_streaming(..., case_id=...)` immediately after
+  `subprocess.Popen` returns. The PID is the child process, **not** the
+  Streamlit master.
+- **Removed** by `run_step_streaming`'s `finally` block when the child
+  exits (normal completion, error, or cancel).
+- **Not** part of the lock schema — `acquire_lock` does not touch it, and
+  `is_lock_stale` does not consult it. The lock and the sidecar have
+  different lifetimes: the lock spans a whole pipeline (Extract → Enrich
+  → Format → Export), while the sidecar tracks **one step at a time**.
+
+### Cancel button — UI
+
+The Cancel button is rendered next to the active-lock banner in Step 2.
+It is visible **only** when both of:
+- `lock.host == socket.gethostname()`
+- `lock.user == getpass.getuser()`
+
+are true — a lock held by another host or user belongs to that operator
+and is not ours to cancel.
+
+Because Streamlit serializes script execution per session, the tab that
+clicked **Run Full Pipeline** is busy inside `run_step_streaming` and
+cannot process its own Cancel click. To cancel a run, **refresh the tab
+or open a second tab** for the same case — the fresh script run reads the
+lock, renders the Cancel button, and the click takes effect there.
+
+### Cancel behavior
+
+`cancel_pipeline(case_id)` performs the following, in order:
+
+1. Read the lock; if `host` or `user` does not match the current process,
+   refuse and return `{killed: False, reason: "refuse: ..."}` without
+   touching anything.
+2. Read the child PID from `.pipeline.subproc_pid` (if present).
+3. Call `_kill_process_tree(pid)` — on Windows this runs
+   `taskkill /F /T /PID <pid>` so the child and any grandchildren are
+   killed together; on POSIX it uses `os.killpg` then falls back to
+   `os.kill(pid, 9)`.
+4. Remove `.pipeline.subproc_pid`.
+5. Call `release_lock(case_id)` to remove `.pipeline.lock`.
+
+Safety guarantees in `_kill_process_tree`:
+- Returns `False` (no-op) for an invalid PID, our own PID, or a PID that
+  is already gone — so a Cancel click after the subprocess has finished
+  naturally is harmless.
+- Never raises — best-effort signalling.
+
+### What is preserved on cancel
+
+- `requirements.partial.jsonl` — every chunk that completed before the
+  cancel is still in the file. Re-running with `--resume` (the default)
+  skips them.
+- `extract_errors.jsonl` — any soft-failed chunk records survive.
+- `requirements.json` / `requirements_enriched.json` / `compliance_matrix.xlsx`
+  — only updated at the very end of their respective steps, so a
+  mid-step cancel leaves the previous version (if any) untouched.
+
+### UX feedback
+
+After cancel, the tab that clicked Cancel re-renders without the lock
+banner and shows:
+
+```
+⏹ Pipeline cancelled by user. killed PID <N> and descendants. Partial progress is preserved.
+```
+
+The tab that was running the pipeline sees its `run_step_streaming` loop
+exit naturally (the subprocess pipe closed), the streaming step records
+a non-zero `returncode`, the per-step `st.status` settles into the error
+state, and `release_lock` runs as a no-op (the lock is already gone).
+
+---
+
+## Phase 4.6J — Persisted run history
+
+Before Phase 4.6J the only record of a pipeline run was the in-memory
+`pipeline_step_results` shown in the current Streamlit session. Once the
+session closed or another run started, the previous result was gone —
+PMs had no way to audit "did the Nokia case finish on Tuesday? did it
+fail or succeed?" without re-running.
+
+Phase 4.6J writes one append-only JSONL file per case that records
+every Step 2 pipeline run, every Step 3.5 normalize run, and every
+Cancel event.
+
+### Path
+
+```
+runs/<case_id>/run_history.jsonl
+```
+
+Excluded from version control (`runs/` is in `.gitignore`). UTF-8 without
+BOM — `append_run_history()` uses `open(..., "a", encoding="utf-8")`
+which never prepends a BOM. (PowerShell's `Out-File -Encoding utf8` does,
+which would break `read_run_history` — see Phase 4.6I post-mortem.)
+
+### Per-record schema
+
+One JSON object per line. Two records per normal run (start + terminal):
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `run_id` | string | 12-char hex (from `uuid.uuid4().hex[:12]`). The "started" and the matching terminal record share this id. |
+| `case_id` | string | Echoes `runs/<case_id>/`. |
+| `operation` | string | One of `"pipeline"` (Run Full Pipeline, `start_step=0`), `"enrich_format_export"` (`start_step=1`), `"normalize"` (Step 3.5), `"unknown"` (cancel against an unrecognized lock). |
+| `status` | string | `"started"`, `"success"`, `"failed"`, or `"cancelled"`. |
+| `started_at` | ISO 8601 | When `acquire_lock()` returned. |
+| `ended_at` | ISO 8601 \| null | Filled on terminal/cancel records; `null` on `"started"`. |
+| `duration_sec` | int \| null | `time.monotonic()` delta on terminal records; `null` on `"started"`. For cancel, computed from lock's `started_at` if parseable, else `null`. |
+| `user` | string | `getpass.getuser()` at write time. |
+| `host` | string | `socket.gethostname()` at write time. |
+| `pid` | int | Streamlit master's `os.getpid()` — useful for cross-tab attribution. |
+| `subproc_pid` | int \| null | Only set on cancel records — the child PID that was killed (`null` if no sidecar). |
+| `start_step` | int \| null | The `pipeline_start_step` for pipeline/enrich runs; `0` for normalize; `null` for cancel against unknown ops. |
+| `steps` | list \| null | On terminal records, a compact summary `[{label, ok, rc}, …]` per step. `null` on `"started"` and `"cancelled"`. |
+| `return_code` | int \| null | Last subprocess `returncode` on terminal records. |
+| `message` | string \| null | One-line summary. On success: the step's `ok_msg`. On failure: `"failed at: <label>"`. On cancel: the `cancel_pipeline()` reason. |
+
+### Operations classification
+
+| `start_step` | Operation written |
+|---|---|
+| `0` | `"pipeline"` |
+| `1` | `"enrich_format_export"` |
+| (normalize button) | `"normalize"` |
+
+Cancel records pull `operation` from the lock file's `operation` field
+(set by `acquire_lock` per Phase 4.6D), so a cancelled pipeline shows
+`"pipeline"` and a cancelled normalize shows `"normalize"`.
+
+### Cancel-induced duplicate terminal records
+
+A cancel from another tab and the original tab's own teardown both write
+terminal records:
+
+1. Tab 1 acquires lock, writes `"started"`, runs subprocess.
+2. Tab 2 clicks Cancel → `cancel_pipeline` kills subprocess, writes
+   `"cancelled"` (with the lock's `operation`).
+3. Tab 1's `run_step_streaming` loop returns (the pipe was closed by the
+   kill), the step records `rc != 0`, the `finally:` block releases the
+   (already-gone) lock, and Tab 1 writes `"failed"`.
+
+The history file therefore contains `started` + `cancelled` + `failed`
+for one user-perceived run. Both terminal records are honest — one
+describes the operator intent, the other the subprocess exit. The UI's
+"Recent runs" expander surfaces them in newest-first order; PMs can read
+the `cancelled` record to understand why the `failed` record is there.
+
+### Safety / best-effort
+
+`append_run_history()` swallows every exception. A failure to write the
+history must never break the pipeline. Likewise `read_run_history()`
+returns `[]` on missing file, decode error, or any other failure, and
+silently skips unparseable lines so a partially corrupt file still
+yields the valid records.
+
+### UI surfacing
+
+- **Step 3 → "Recent runs (N)" expander** (collapsed by default). Lists
+  the latest 5 records, newest first, as one-line bullets:
+  ```
+  ✅ `2026-06-04T15:32:11` · **enrich_format_export** · success · 142s — Compliance matrix exported and ready for distribution.
+  ⏹ `2026-06-04T14:48:30` · **pipeline** · cancelled · 312s — killed PID 12428 and descendants
+  ❌ `2026-06-04T14:11:02` · **pipeline** · failed · 47s — failed at: Extract — 讀取 RFQ，AI 提取需求條目
+  ```
+- **Step 3 → Advanced Outputs**: `run_history.jsonl` listed alongside
+  the other intermediate artifacts.
+
+### Backward compat
+
+A case with no history file simply shows no expander — old cases are not
+broken. The first run on a fresh case creates the file.

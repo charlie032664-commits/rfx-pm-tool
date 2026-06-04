@@ -45,6 +45,7 @@ sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 from openai import OpenAI
 
 from llm_client import get_client, get_model, is_available
+from file_selection import load_excluded   # Phase 7: enforce Step 1.5 exclusion
 
 
 # -----------------------------
@@ -84,10 +85,19 @@ def sha256_file(p: Path, buf_size: int = 1024 * 1024) -> str:
     return h.hexdigest()
 
 
-def build_manifest(rfq_dir: Path) -> Dict[str, Any]:
+def build_manifest(rfq_dir: Path, excluded: "set[str] | None" = None) -> Dict[str, Any]:
+    """Build manifest of files in rfq_dir.
+
+    Phase 7: filenames in `excluded` (from Step 1.5 file_selection.json) are
+    omitted from manifest.files[] entirely. Defaults to processing every file
+    when excluded is None / empty for backward compatibility.
+    """
+    excluded = excluded or set()
     files = []
     for p in sorted(rfq_dir.glob("**/*")):
         if p.is_dir():
+            continue
+        if p.name in excluded:
             continue
         stat = p.stat()
         files.append({
@@ -471,8 +481,11 @@ def enrich_requirements(
     enriched: List[Dict[str, Any]] = []
 
     reqs: List[Dict[str, Any]] = req_doc.get("requirements", []) or []
+    total = len(reqs)
 
-    for r in reqs:
+    for i, r in enumerate(reqs, start=1):
+        # Phase 4.6F.2 — per-item progress for the streaming UI
+        print(f"[PROGRESS] enrich item {i}/{total} req_id={r.get('req_id') or '?'}")
         req_id = r.get("req_id", "")
         text = r.get("requirement", "")
         notes = r.get("notes", "")
@@ -598,8 +611,12 @@ def main():
     out_dir = runs_root / case_id
     ensure_dir(out_dir)
 
-    # 1) manifest
-    manifest = build_manifest(rfq_dir)
+    # 1) manifest — Phase 7: honour Step 1.5 exclusion list
+    excluded_files = load_excluded(case_dir)
+    if excluded_files:
+        print(f"[INFO] Step 1.5: {len(excluded_files)} file(s) excluded from manifest: "
+              f"{sorted(excluded_files)}")
+    manifest = build_manifest(rfq_dir, excluded_files)
     write_json(out_dir / "manifest.json", manifest)
 
     # 2) load rules
