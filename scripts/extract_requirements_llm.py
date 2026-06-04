@@ -15,7 +15,7 @@ Features:
 - De-dup when loading partial
 
 Usage (run from scripts/ai_rfx):
-  python extract_requirements_llm.py --case inbound\\20260129_IBM_RFQ --runs runs --max-chars 1200 --group-size 3 --resume
+  python extract_requirements_llm.py --case inbound\\sample_case --runs runs --max-chars 1200 --group-size 3 --resume
 """
 
 from __future__ import annotations
@@ -1273,7 +1273,7 @@ def dedup_requirements(reqs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 # -----------------------------
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--case", required=True, help=r"Case folder, e.g. inbound\20260129_IBM_RFQ")
+    ap.add_argument("--case", required=True, help=r"Case folder, e.g. inbound\sample_case")
     ap.add_argument("--runs", required=True, help=r"Runs root, e.g. runs")
     ap.add_argument("--model", default=None, help="Override model (default: resolved by LLM_PROVIDER / OPENAI_MODEL / INTERNAL_LLM_MODEL)")
     ap.add_argument("--max-chars", type=int, default=1200, help="Chunk size by characters")

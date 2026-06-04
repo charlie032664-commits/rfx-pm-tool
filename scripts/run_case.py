@@ -21,8 +21,8 @@ Pipeline:
 - Output: runs/<case_id>/requirements_enriched.json
 
 Usage (from scripts/ai_rfx):
-  python run_case.py --case .\\inbound\\20260129_IBM_RFQ --rules .\\rules --runs .\\runs
-  python run_case.py --case .\\inbound\\20260129_IBM_RFQ --rules .\\rules --runs .\\runs --use-mock
+  python run_case.py --case .\\inbound\\sample_case --rules .\\rules --runs .\\runs
+  python run_case.py --case .\\inbound\\sample_case --rules .\\rules --runs .\\runs --use-mock
 """
 
 from __future__ import annotations
@@ -167,7 +167,7 @@ def is_glossary_definition(requirement: str, notes: str) -> bool:
         return True
 
     # Acronym definition: 2~15 chars (letters/numbers/ -/ ) + ":" + something
-    # Examples: "IBM: International Business Machines", "FRU: Field Replaceable Unit"
+    # Examples: "RAM: Random Access Memory", "FRU: Field Replaceable Unit"
     if re.match(r"^[A-Z0-9][A-Z0-9 \-/]{1,15}\s*:\s*.+", req_text):
         return True
 
@@ -289,7 +289,7 @@ def mock_requirements() -> Dict[str, Any]:
             {
                 "req_id": "AUTO-mock-1-001",
                 "source": {"file": "mock.docx", "chunk": 1},
-                "requirement": "IBM: International Business Machines",
+                "requirement": "RAM: Random Access Memory",
                 "notes": "GLOSSARY/DEFINITION",
                 "confidence": 0.6
             },
@@ -588,7 +588,7 @@ def enrich_requirements(
 # -----------------------------
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--case", required=True, help="Path to one case folder, e.g. inbound/20260129_IBM_RFQ")
+    ap.add_argument("--case", required=True, help="Path to one case folder, e.g. inbound/sample_case")
     ap.add_argument("--rules", required=True, help="Path to rules folder, e.g. rules/")
     ap.add_argument("--runs", required=True, help="Path to runs folder, e.g. runs/")
     ap.add_argument("--use-mock", action="store_true", help="Use mock requirements (no extractor yet)")

@@ -11,9 +11,8 @@ Conservative defaults — falls back to empty set (= process everything) when:
   - an entry's `include` field is missing, None, or anything other than
     a literal False
 
-This preserves backward compatibility with all existing baselines
-(IBM / HPE / Nokia / SilverPeak / AtlasRFQ / AA), which were captured before
-file_selection.json existed.
+This preserves backward compatibility with case baselines captured
+before file_selection.json existed.
 
 Usage:
     from file_selection import load_excluded

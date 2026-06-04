@@ -4,8 +4,8 @@ Export compliance matrix Excel (3 sheets) from requirements_clean.json
 (output of postprocess_requirements.py). Falls back to requirements_enriched.json (legacy).
 
 Usage:
-  python export_excel.py --case 20260129_IBM_RFQ
-  python export_excel.py --in runs/20260129_IBM_RFQ/requirements_clean.json --out runs/20260129_IBM_RFQ/compliance_matrix.xlsx
+  python export_excel.py --case sample_case
+  python export_excel.py --in runs/sample_case/requirements_clean.json --out runs/sample_case/compliance_matrix.xlsx
 """
 
 from __future__ import annotations

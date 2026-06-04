@@ -43,10 +43,10 @@ _RFQ_TABLE_ID_PATTERNS = [
 # Global AI sequence counter — used for *all* system-generated ids.
 # Phase 4 ID policy (revised):
 #   - RFQ-* : customer-supplied id from a trusted structured source
-#             (e.g. IBM table [ROW_ID=HOST-1] → RFQ-HOST-001,
-#              Nokia simple_list xlsx ID column "1" → RFQ-001)
+#             (e.g. matrix-style table [ROW_ID=HOST-1] → RFQ-HOST-001,
+#              simple_list xlsx ID column "1" → RFQ-001)
 #   - AI-NNN: system-generated when no trustworthy id exists
-#             (e.g. HPE doc_schema rule="AI auto" → demote any LLM-hallucinated
+#             (e.g. doc_schema rule="AI auto" → demote any LLM-hallucinated
 #              RFQ-* to AI-NNN)
 _AI_SEQ = {"n": 0}
 
@@ -761,12 +761,12 @@ def ensure_req_id(
       - "generated" : no trustworthy id; fresh AI-<NNN>.
 
     Output formats:
-      - RFQ-<PREFIX>-<NNN>  : trusted PREFIX-N table-row id  (IBM, ...)
+      - RFQ-<PREFIX>-<NNN>  : trusted PREFIX-N table-row id (matrix-style)
       - RFQ-<NNN>           : trusted numeric raw id from a structured source
-                              (Nokia simple_list xlsx ID column)
+                              (simple_list xlsx ID column)
       - RFQ-TBL-<NNN>       : trusted ROW_ID=N marker
-      - AI-<NNN>            : system-generated; covers LLM-hallucinated RFQ-*
-                              (HPE), unknown raw ids, and AUTO-* placeholders.
+      - AI-<NNN>            : system-generated; covers LLM-hallucinated RFQ-*,
+                              unknown raw ids, and AUTO-* placeholders.
 
     Special inputs:
       __id_locked__=True  — outer split-pipe call already resolved this id;
@@ -830,7 +830,7 @@ def ensure_req_id(
     if re.match(r"^AI-\d+(?:-[a-z0-9]+)?$", rid_str):
         return (rid_str, "generated", original_id)
 
-    # Case 2.5: structured numeric raw id  (Nokia simple_list xlsx ID column: "1" → RFQ-001)
+    # Case 2.5: structured numeric raw id  (simple_list xlsx ID column: "1" → RFQ-001)
     if rid_str and is_structured and rid_str.isdigit():
         return (f"RFQ-{int(rid_str):03d}", "original", original_id)
 

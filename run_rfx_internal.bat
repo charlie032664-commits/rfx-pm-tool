@@ -2,27 +2,23 @@
 chcp 65001 >nul
 
 :: ============================================
-:: RFX PM Tool — Internal LLM mode
+:: RFX PM Tool — Internal / self-hosted LLM mode
 :: ============================================
-:: INTERNAL_LLM_API_KEY is read from Windows env vars (already set).
-:: Change the MODEL line below to switch models.
+:: Use this launcher when your LLM provider is an OpenAI-compatible
+:: internal endpoint (e.g. a vLLM / Ollama / TGI server) instead of OpenAI.
+:: INTERNAL_LLM_API_KEY is read from Windows env vars (set it once with
+:: setx, this script reuses it).
 :: ============================================
 
 :: --- Provider ---
 set "LLM_PROVIDER=internal"
 
-:: --- Base URL (change to your internal endpoint) ---
-set "INTERNAL_LLM_BASE_URL=https://172.17.20.220/api/v1"
+:: --- Base URL — set this to your internal LLM endpoint, e.g.
+::     set "INTERNAL_LLM_BASE_URL=https://your-internal-host/api/v1"
+set "INTERNAL_LLM_BASE_URL="
 
-:: --- Model (uncomment ONE line) ---
-:: General review / RFQ extraction (default after Qwen3-32B retirement)
-set "INTERNAL_LLM_MODEL=qwen3-next-80b"
-:: Code generation / code fix (still in service):
-:: set "INTERNAL_LLM_MODEL=qwen3-coder-next"
-:: --- Retired ---
-:: set "INTERNAL_LLM_MODEL=nvidia/Qwen3-32B-NVFP4"
-:: set "INTERNAL_LLM_MODEL=Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8"
-:: set "INTERNAL_LLM_MODEL=nvidia/Gemma-4-31B-IT-NVFP4"
+:: --- Model — name your internal endpoint serves (e.g. qwen3-next-80b) ---
+set "INTERNAL_LLM_MODEL="
 
 :: --- Timeout (seconds) ---
 set "LLM_TIMEOUT_SECONDS=120"

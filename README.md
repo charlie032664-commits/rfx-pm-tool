@@ -105,10 +105,10 @@ UI provides two run modes:
 
 | Mode | Trigger | LLM | Example |
 |------|---------|-----|---------|
-| **Strict** | Default for all formats | Yes | IBM RFQ (shall/must requirements) |
-| **Direct parse** | `rfq_format=simple_list` + xlsx | No | Nokia Q&A spreadsheet |
-| **Relaxed** | `rfq_format=spec_reference` + xlsx | No | AtlasRFQ spec table |
-| **Checklist** | Appendix xlsx with auto-detected compliance header | No | AA Compliance Table |
+| **Strict** | Default for all formats | Yes | RFQ document with explicit shall/must requirements |
+| **Direct parse** | `rfq_format=simple_list` + xlsx | No | Q&A-style requirement spreadsheet |
+| **Relaxed** | `rfq_format=spec_reference` + xlsx | No | Spec reference table |
+| **Checklist** | Appendix xlsx with auto-detected compliance header | No | Compliance checklist xlsx |
 
 Relaxed mode produces **derived requirements** (`derived: true`) marked `NEED_REVIEW`.
 Checklist mode parses compliance checklists (Ref# / Requirement / Priority / Comply columns) as regular requirements with priority mapping (M→MUST, H→MUST, L→MAY).

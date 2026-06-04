@@ -216,7 +216,7 @@ Note: `COMPLIANT`/`PARTIAL`/`NON-COMPLIANT` are stored in `responses/<case>/resp
 - Triggered by: `doc_schema.rfq_format == "simple_list"` AND xlsx with identifiable ID/Question/Answer columns
 - Extraction: Direct xlsx parse, no LLM needed
 - `derived`: `false` (these are actual customer questions)
-- Example: Nokia Q&A spreadsheet
+- Example: Q&A-style requirement spreadsheet
 
 ### Checklist Parse (auto-detected)
 
@@ -228,7 +228,7 @@ Note: `COMPLIANT`/`PARTIAL`/`NON-COMPLIANT` are stored in `responses/<case>/resp
 - req_id: from Ref# column if available, otherwise AUTO-generated
 - Section headers (short text without Priority) are automatically skipped
 - Quote templates and non-checklist xlsx files are not affected (header detection rejects them)
-- Example: AA case `(C) Quantum...Compliance Table.xlsx` → 219 items from 3 sheets
+- Example: Compliance Table xlsx with 3 sheets → ~219 checklist items
 
 **must_level preserve fix**: `run_case.py` preserves must_level values set during extraction
 (e.g., Priority=M→MUST from checklist). Without this fix, keyword-based enrichment would
@@ -238,9 +238,9 @@ misclassified as notes.
 ### Mode Coexistence
 
 A single case may use multiple modes:
-- **SilverPeak**: .doc main (strict) + .docx appendix (skipped)
-- **AtlasRFQ**: .xlsx appendix (relaxed spec_reference, 28 derived) + .pdf (skipped)
-- **AA**: .docx main (strict, ~476 reqs) + .xlsx appendix checklist (219 items) + .xlsx quote template (skipped) + .pdf (skipped)
+- **Case A**: .doc main (strict) + .docx appendix (skipped)
+- **Case B**: .xlsx appendix (relaxed spec_reference, ~28 derived) + .pdf (skipped)
+- **Case C**: .docx main (strict, several hundred reqs) + .xlsx appendix checklist (~219 items) + .xlsx quote template (skipped) + .pdf (skipped)
 
 ---
 
@@ -254,35 +254,36 @@ Deterministic — two consecutive postprocess runs produce identical output.
 
 | Case | rfq_format | Mode | Req | Glo | Note | Total | NEW | NR | SKIP | Derived |
 |------|-----------|------|-----|-----|------|-------|-----|----|------|---------|
-| **SilverPeak** | spec_reference | Strict (main .doc) | 149 | 8 | 28 | 185 | 128 | 21 | 36 | 0 |
-| **Nokia** | simple_list | Direct parse (xlsx Q&A) | 99 | 4 | 5 | 108 | 80 | 19 | 9 | 0 |
-| **AtlasRFQ** | spec_reference | Relaxed (xlsx spec table) | 28 | 0 | 0 | 28 | 0 | 28 | 0 | 28 |
-| **IBM** | ibm_matrix | Strict (keyword) | 182 | 31 | 35 | 248 | 118 | 64 | 66 | 0 |
-| **AA** | plain_text | Strict + Checklist | 591 | 6 | 54 | 651 | 486 | 105 | 60 | 0 |
+| **Case A** | spec_reference | Strict (main .doc) | 149 | 8 | 28 | 185 | 128 | 21 | 36 | 0 |
+| **Case B** | simple_list | Direct parse (xlsx Q&A) | 99 | 4 | 5 | 108 | 80 | 19 | 9 | 0 |
+| **Case C** | spec_reference | Relaxed (xlsx spec table) | 28 | 0 | 0 | 28 | 0 | 28 | 0 | 28 |
+| **Case D** | ibm_matrix | Strict (keyword) | 182 | 31 | 35 | 248 | 118 | 64 | 66 | 0 |
+| **Case E** | plain_text | Strict + Checklist | 591 | 6 | 54 | 651 | 486 | 105 | 60 | 0 |
 
 Post-processing effects (this baseline):
 
 | Case | Before Clean | Dedup Removed | Junk Removed | After Clean |
 |------|-------------|---------------|--------------|-------------|
-| SilverPeak | 193 | 0 | 8 | 185 |
-| Nokia | 108 | 0 | 0 | 108 |
-| AtlasRFQ | 28 | 0 | 0 | 28 |
-| IBM | 265 | 50 | 6 | 209 |
-| AA | 695 | 35 | 54 | 606 |
+| Case A | 193 | 0 | 8 | 185 |
+| Case B | 108 | 0 | 0 | 108 |
+| Case C | 28 | 0 | 0 | 28 |
+| Case D | 265 | 50 | 6 | 209 |
+| Case E | 695 | 35 | 54 | 606 |
 
 ### Legacy LLM baseline (2026-04-29, before enriched.json overwrite)
 
 Previous baseline recorded before enriched.json files were regenerated with `--no-llm`.
-These numbers reflected LLM-enriched results for SilverPeak/Nokia/IBM and are no longer reproducible
-from current enriched.json files (overwritten). Kept for reference only.
+These numbers reflected LLM-enriched results for the same cases above and
+are no longer reproducible from current enriched.json files (overwritten).
+Kept for reference only.
 
 | Case | rfq_format | Mode | Req | Glo | Note | Notes |
 |------|-----------|------|-----|-----|------|-------|
-| SilverPeak | spec_reference | Strict (LLM-enriched) | 177 | 8 | 0 | LLM enrichment produced more MUST/SHOULD classifications |
-| Nokia | simple_list | Direct parse | 104 | 4 | 0 | Minimal LLM effect on direct-parsed items |
-| AtlasRFQ | spec_reference | Relaxed | 28 | 0 | 0 | No change — derived items bypass enrichment |
-| IBM | ibm_matrix | Strict (LLM-enriched) | 214 | 34 | 0 | LLM enrichment classified more items as requirement |
-| AA | plain_text | Strict only (no checklist) | 503 | 9 | 0 | Before checklist parser; before must_level fix |
+| Case A | spec_reference | Strict (LLM-enriched) | 177 | 8 | 0 | LLM enrichment produced more MUST/SHOULD classifications |
+| Case B | simple_list | Direct parse | 104 | 4 | 0 | Minimal LLM effect on direct-parsed items |
+| Case C | spec_reference | Relaxed | 28 | 0 | 0 | No change — derived items bypass enrichment |
+| Case D | ibm_matrix | Strict (LLM-enriched) | 214 | 34 | 0 | LLM enrichment classified more items as requirement |
+| Case E | plain_text | Strict only (no checklist) | 503 | 9 | 0 | Before checklist parser; before must_level fix |
 
 Difference explanation: LLM enrichment assigns MUST/SHOULD more aggressively than keyword matching,
 causing more short items to be promoted from note → requirement in postprocess. The `--no-llm` baseline
@@ -772,8 +773,8 @@ state, and `release_lock` runs as a no-op (the lock is already gone).
 Before Phase 4.6J the only record of a pipeline run was the in-memory
 `pipeline_step_results` shown in the current Streamlit session. Once the
 session closed or another run started, the previous result was gone —
-PMs had no way to audit "did the Nokia case finish on Tuesday? did it
-fail or succeed?" without re-running.
+PMs had no way to audit "did a particular case finish on Tuesday? did
+it fail or succeed?" without re-running.
 
 Phase 4.6J writes one append-only JSONL file per case that records
 every Step 2 pipeline run, every Step 3.5 normalize run, and every
@@ -878,7 +879,7 @@ mistakes were:
 - Operating on the wrong case after a long browser session (the sidebar
   selectbox is easy to miss when scrolled to Step 2).
 - Re-extracting a doc that the prior run already taught us was huge —
-  the 2979-chunk SilverPeak spec is the canonical example.
+  the 2979-chunk specification document case is the canonical example.
 
 Phase 4.6H adds in-flight UI prompts in Step 2 to make these mistakes
 explicit and confirmable.
