@@ -866,3 +866,90 @@ yields the valid records.
 
 A case with no history file simply shows no expander — old cases are not
 broken. The first run on a fresh case creates the file.
+
+---
+
+## Phase 4.6H — Runtime guard
+
+After PM trials it became clear that the most common cost-burning
+mistakes were:
+- Pressing **Run Full Pipeline** on a case that already had a finished
+  `requirements.json`, accidentally re-running Extract.
+- Operating on the wrong case after a long browser session (the sidebar
+  selectbox is easy to miss when scrolled to Step 2).
+- Re-extracting a doc that the prior run already taught us was huge —
+  the 2979-chunk SilverPeak spec is the canonical example.
+
+Phase 4.6H adds in-flight UI prompts in Step 2 to make these mistakes
+explicit and confirmable.
+
+### Current case banner
+
+Top of Step 2:
+
+```
+Current case: <case_id>
+```
+
+Rendered as a one-line `st.markdown` in `#0D47A1` (deep blue) so the
+active case is visually unambiguous next to the Pipeline buttons.
+
+### `requirements.json` exists recommendation
+
+When `runs/<case>/requirements.json` is present and non-trivial:
+
+```
+ℹ️ requirements.json already exists. Recommended: use ⚡ Enrich + Format + Export
+unless you intentionally want to re-run extraction.
+```
+
+The Enrich+Format+Export button also gets a `(Recommended)` suffix in
+the same condition so the choice is reinforced at the click target.
+
+### Size-based warnings (from prior partial.jsonl)
+
+`_estimate_chunks_from_partial(case_id)` reads
+`runs/<case>/requirements.partial.jsonl` and sums **max chunk index per
+file** (not line count — resumed runs and Phase 4.6G's failed-chunk
+marker rows can double-count if we count lines). The result is treated
+as the doc's chunk count from the previous extract.
+
+| Estimated chunks | UI |
+|---|---|
+| `> 1000` | ⚠ **Very large document** warning (yellow) |
+| `> 300` and `≤ 1000` | ⚠ **Large extraction history** warning (yellow) |
+| `≤ 300` | No size warning |
+
+### Confirmation checkbox
+
+Run Full Pipeline is **disabled until checked** whenever either:
+- `requirements.json` exists for the case, OR
+- `_estimate_chunks_from_partial(case_id) > 300`.
+
+```
+☐ I understand Full Pipeline will re-run extraction and may take a long time.
+```
+
+The checkbox state is keyed by `selected_case`, so toggling cases
+discards the confirmation (so the operator confirms per case, not
+globally).
+
+### Always-shown notice above Full Pipeline
+
+```
+ℹ️ Full Pipeline will re-run Extract and may take a long time.
+```
+
+Shown unconditionally so a PM with a fresh case still sees the cost
+notice before clicking.
+
+### What does NOT change
+
+- **⚡ Enrich + Format + Export** is unaffected and remains clickable
+  whenever `requirements.json` exists. Its label gets the
+  `(Recommended)` suffix when prior extraction output is present, but it
+  has no checkbox guard.
+- **Run Full Pipeline** is still clickable normally on a fresh case
+  (no `requirements.json`, no partial, or `≤ 300` estimated chunks).
+- Step 3.5 Normalize is unaffected.
+- Lock / sidecar / cancel behavior unchanged.

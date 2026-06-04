@@ -826,6 +826,38 @@ def _record_cancel_history(case_id: str, lock_info: dict, killed_pid: int | None
         pass
 
 
+# Phase 4.6H — Runtime guard helper: estimate the doc's chunk count from
+# the partial.jsonl we wrote on the previous extract. Uses max(chunk) per
+# file (not line count) because resumed/repeated runs may emit duplicate
+# records and the script's chunk numbering is 1-indexed and monotonic.
+
+def _estimate_chunks_from_partial(case_id: str) -> int:
+    """Sum of max chunk index per file in requirements.partial.jsonl.
+    Returns 0 on missing file, parse error, or any other failure — the
+    UI just doesn't show the size warning in that case."""
+    p = RUNS_DIR / case_id / "requirements.partial.jsonl"
+    if not p.exists():
+        return 0
+    max_per_file: dict[str, int] = {}
+    try:
+        for line in p.read_text(encoding="utf-8", errors="ignore").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except Exception:
+                continue
+            f = rec.get("file")
+            c = rec.get("chunk")
+            if isinstance(f, str) and isinstance(c, int) and c > 0:
+                if c > max_per_file.get(f, 0):
+                    max_per_file[f] = c
+    except Exception:
+        return 0
+    return sum(max_per_file.values())
+
+
 # ── Sidebar ──────────────────────────────────────────────────────────────────
 
 st.sidebar.title("RFX PM Tool")
@@ -1080,6 +1112,15 @@ st.divider()
 
 if mode == "Select Existing Case":
     st.subheader("Step 2: Run Pipeline")
+
+    # Phase 4.6H — Runtime guard: prominent case display. The sidebar
+    # selectbox is easy to overlook after a long browser session; this
+    # makes the active case unambiguous next to the Pipeline buttons.
+    st.markdown(
+        f"<p style='font-size:1.05rem;color:#0D47A1;margin:0 0 8px 0;'>"
+        f"<b>Current case:</b> <code>{selected_case}</code></p>",
+        unsafe_allow_html=True,
+    )
 
     case_inbound = INBOUND_DIR / selected_case
     case_runs    = RUNS_DIR / selected_case
@@ -1376,6 +1417,47 @@ if mode == "Select Existing Case":
             st.success("Stale lock cleared.")
             st.rerun()
 
+    # ── Phase 4.6H — Runtime guard: pre-button context + size warnings ──
+    _est_chunks = _estimate_chunks_from_partial(selected_case)
+
+    if req_json_exists:
+        st.info(
+            "ℹ️ `requirements.json` already exists. **Recommended:** use "
+            "**⚡ Enrich + Format + Export** unless you intentionally want "
+            "to re-run extraction."
+        )
+
+    if _est_chunks > 1000:
+        st.warning(
+            f"⚠ **Very large document** — previous extract recorded "
+            f"~{_est_chunks} chunks. A full re-extract may take a long time "
+            f"and consume significant LLM budget."
+        )
+    elif _est_chunks > 300:
+        st.warning(
+            f"⚠ **Large extraction history** — previous extract recorded "
+            f"~{_est_chunks} chunks. Re-extraction will take a while."
+        )
+
+    st.markdown(
+        "<p style='font-size:0.95rem;color:#BF360C;margin:8px 0 4px 0;'>"
+        "ℹ️ Full Pipeline will re-run Extract and may take a long time.</p>",
+        unsafe_allow_html=True,
+    )
+
+    # Confirmation checkbox gates Run Full Pipeline whenever prior state
+    # suggests re-extraction is expensive or unnecessary.
+    _need_confirm = req_json_exists or _est_chunks > 300
+    if _need_confirm:
+        _confirm_full = st.checkbox(
+            "I understand Full Pipeline will re-run extraction and may "
+            "take a long time.",
+            key=f"confirm_full_pipeline_{selected_case}",
+            value=False,
+        )
+    else:
+        _confirm_full = True
+
     # ── Buttons (disabled while running OR while another session holds the lock) ──
     col_btn1, col_btn2, col_btn3 = st.columns([1, 1, 1])
     with col_btn1:
@@ -1383,16 +1465,22 @@ if mode == "Select Existing Case":
             btn_label = "🔒  Locked by another session"
         elif st.session_state.pipeline_running:
             btn_label = "⏳  Pipeline Running…"
+        elif not _confirm_full:
+            btn_label = "► Run Full Pipeline (confirm first)"
         else:
             btn_label = "► Run Full Pipeline"
         run_all = st.button(btn_label, type="primary",
-                            disabled=st.session_state.pipeline_running or _lock_active,
+                            disabled=(st.session_state.pipeline_running
+                                      or _lock_active
+                                      or not _confirm_full),
                             use_container_width=True, help="Step 1 (LLM) + Step 2 + Step 3 + Step 4")
     with col_btn2:
         if _lock_active:
             btn_label2 = "🔒  Locked by another session"
         elif st.session_state.pipeline_running:
             btn_label2 = "⏳  Pipeline Running…"
+        elif req_json_exists:
+            btn_label2 = "⚡ Enrich + Format + Export  (Recommended)"
         else:
             btn_label2 = "⚡ Enrich + Format + Export"
         run_partial = st.button(btn_label2,
