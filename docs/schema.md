@@ -764,3 +764,105 @@ The tab that was running the pipeline sees its `run_step_streaming` loop
 exit naturally (the subprocess pipe closed), the streaming step records
 a non-zero `returncode`, the per-step `st.status` settles into the error
 state, and `release_lock` runs as a no-op (the lock is already gone).
+
+---
+
+## Phase 4.6J — Persisted run history
+
+Before Phase 4.6J the only record of a pipeline run was the in-memory
+`pipeline_step_results` shown in the current Streamlit session. Once the
+session closed or another run started, the previous result was gone —
+PMs had no way to audit "did the Nokia case finish on Tuesday? did it
+fail or succeed?" without re-running.
+
+Phase 4.6J writes one append-only JSONL file per case that records
+every Step 2 pipeline run, every Step 3.5 normalize run, and every
+Cancel event.
+
+### Path
+
+```
+runs/<case_id>/run_history.jsonl
+```
+
+Excluded from version control (`runs/` is in `.gitignore`). UTF-8 without
+BOM — `append_run_history()` uses `open(..., "a", encoding="utf-8")`
+which never prepends a BOM. (PowerShell's `Out-File -Encoding utf8` does,
+which would break `read_run_history` — see Phase 4.6I post-mortem.)
+
+### Per-record schema
+
+One JSON object per line. Two records per normal run (start + terminal):
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `run_id` | string | 12-char hex (from `uuid.uuid4().hex[:12]`). The "started" and the matching terminal record share this id. |
+| `case_id` | string | Echoes `runs/<case_id>/`. |
+| `operation` | string | One of `"pipeline"` (Run Full Pipeline, `start_step=0`), `"enrich_format_export"` (`start_step=1`), `"normalize"` (Step 3.5), `"unknown"` (cancel against an unrecognized lock). |
+| `status` | string | `"started"`, `"success"`, `"failed"`, or `"cancelled"`. |
+| `started_at` | ISO 8601 | When `acquire_lock()` returned. |
+| `ended_at` | ISO 8601 \| null | Filled on terminal/cancel records; `null` on `"started"`. |
+| `duration_sec` | int \| null | `time.monotonic()` delta on terminal records; `null` on `"started"`. For cancel, computed from lock's `started_at` if parseable, else `null`. |
+| `user` | string | `getpass.getuser()` at write time. |
+| `host` | string | `socket.gethostname()` at write time. |
+| `pid` | int | Streamlit master's `os.getpid()` — useful for cross-tab attribution. |
+| `subproc_pid` | int \| null | Only set on cancel records — the child PID that was killed (`null` if no sidecar). |
+| `start_step` | int \| null | The `pipeline_start_step` for pipeline/enrich runs; `0` for normalize; `null` for cancel against unknown ops. |
+| `steps` | list \| null | On terminal records, a compact summary `[{label, ok, rc}, …]` per step. `null` on `"started"` and `"cancelled"`. |
+| `return_code` | int \| null | Last subprocess `returncode` on terminal records. |
+| `message` | string \| null | One-line summary. On success: the step's `ok_msg`. On failure: `"failed at: <label>"`. On cancel: the `cancel_pipeline()` reason. |
+
+### Operations classification
+
+| `start_step` | Operation written |
+|---|---|
+| `0` | `"pipeline"` |
+| `1` | `"enrich_format_export"` |
+| (normalize button) | `"normalize"` |
+
+Cancel records pull `operation` from the lock file's `operation` field
+(set by `acquire_lock` per Phase 4.6D), so a cancelled pipeline shows
+`"pipeline"` and a cancelled normalize shows `"normalize"`.
+
+### Cancel-induced duplicate terminal records
+
+A cancel from another tab and the original tab's own teardown both write
+terminal records:
+
+1. Tab 1 acquires lock, writes `"started"`, runs subprocess.
+2. Tab 2 clicks Cancel → `cancel_pipeline` kills subprocess, writes
+   `"cancelled"` (with the lock's `operation`).
+3. Tab 1's `run_step_streaming` loop returns (the pipe was closed by the
+   kill), the step records `rc != 0`, the `finally:` block releases the
+   (already-gone) lock, and Tab 1 writes `"failed"`.
+
+The history file therefore contains `started` + `cancelled` + `failed`
+for one user-perceived run. Both terminal records are honest — one
+describes the operator intent, the other the subprocess exit. The UI's
+"Recent runs" expander surfaces them in newest-first order; PMs can read
+the `cancelled` record to understand why the `failed` record is there.
+
+### Safety / best-effort
+
+`append_run_history()` swallows every exception. A failure to write the
+history must never break the pipeline. Likewise `read_run_history()`
+returns `[]` on missing file, decode error, or any other failure, and
+silently skips unparseable lines so a partially corrupt file still
+yields the valid records.
+
+### UI surfacing
+
+- **Step 3 → "Recent runs (N)" expander** (collapsed by default). Lists
+  the latest 5 records, newest first, as one-line bullets:
+  ```
+  ✅ `2026-06-04T15:32:11` · **enrich_format_export** · success · 142s — Compliance matrix exported and ready for distribution.
+  ⏹ `2026-06-04T14:48:30` · **pipeline** · cancelled · 312s — killed PID 12428 and descendants
+  ❌ `2026-06-04T14:11:02` · **pipeline** · failed · 47s — failed at: Extract — 讀取 RFQ，AI 提取需求條目
+  ```
+- **Step 3 → Advanced Outputs**: `run_history.jsonl` listed alongside
+  the other intermediate artifacts.
+
+### Backward compat
+
+A case with no history file simply shows no expander — old cases are not
+broken. The first run on a fresh case creates the file.

@@ -6,6 +6,7 @@ import socket
 import subprocess
 import sys
 import time
+import uuid
 import pandas as pd
 import streamlit as st
 import yaml
@@ -699,6 +700,11 @@ def cancel_pipeline(case_id: str) -> dict:
     kill anything (the lock belongs to someone else). The lock itself is
     left intact in that case so the rightful owner can still see / clear it.
 
+    Phase 4.6J: writes a "cancelled" record to run_history.jsonl when the
+    cleanup actually runs (i.e. not when we refuse on host/user mismatch).
+    The record reuses the lock's started_at when available so duration is
+    meaningful.
+
     Returns {"killed": bool, "reason": str}.
     """
     info = read_lock_info(case_id) or {}
@@ -715,10 +721,109 @@ def cancel_pipeline(case_id: str) -> dict:
     release_lock(case_id)
 
     if killed:
-        return {"killed": True, "reason": f"killed PID {pid} and descendants"}
-    if pid is None:
-        return {"killed": False, "reason": "no active subprocess sidecar; lock cleared"}
-    return {"killed": False, "reason": f"PID {pid} already gone; lock cleared"}
+        reason = f"killed PID {pid} and descendants"
+    elif pid is None:
+        reason = "no active subprocess sidecar; lock cleared"
+    else:
+        reason = f"PID {pid} already gone; lock cleared"
+
+    # Phase 4.6J — record the cancel event.
+    _record_cancel_history(case_id, info, pid, killed, reason)
+
+    return {"killed": killed, "reason": reason}
+
+
+# Phase 4.6J — Persisted run history (append-only JSONL per case).
+#
+# Lifecycle: every Step 2 pipeline run and Step 3.5 normalize run writes a
+# "started" record at launch and a "success" / "failed" record at finish.
+# cancel_pipeline writes a "cancelled" record. Writes are best-effort; a
+# failure to append must NEVER break the pipeline. UTF-8 without BOM is
+# enforced because PowerShell-written BOM files have bitten us before
+# (the json.loads call in read_lock_info rejects the U+FEFF prefix).
+
+def _run_history_path(case_id: str) -> Path:
+    return RUNS_DIR / case_id / "run_history.jsonl"
+
+
+def _new_run_id() -> str:
+    """Short stable id for grouping started/terminal records of one run."""
+    return uuid.uuid4().hex[:12]
+
+
+def append_run_history(case_id: str, record: dict) -> None:
+    """Best-effort append one record to runs/<case_id>/run_history.jsonl.
+    Never raises — a history write failure must not break the pipeline."""
+    try:
+        p = _run_history_path(case_id)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        # Explicit UTF-8 no BOM. open(..., "a", encoding="utf-8") on CPython
+        # does NOT prepend a BOM; we rely on that contract.
+        with open(p, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def read_run_history(case_id: str, limit: int = 5) -> list[dict]:
+    """Return up to `limit` most recent records, newest first. Returns []
+    on missing file, decode errors, or any other failure — bad lines are
+    silently skipped so a partially-corrupt file still yields good records."""
+    p = _run_history_path(case_id)
+    if not p.exists():
+        return []
+    out: list[dict] = []
+    try:
+        lines = [
+            l for l in p.read_text(encoding="utf-8", errors="ignore").splitlines()
+            if l.strip()
+        ]
+        for line in reversed(lines):
+            try:
+                rec = json.loads(line)
+            except Exception:
+                continue
+            if isinstance(rec, dict):
+                out.append(rec)
+                if len(out) >= limit:
+                    break
+    except Exception:
+        return out
+    return out
+
+
+def _record_cancel_history(case_id: str, lock_info: dict, killed_pid: int | None,
+                           killed: bool, reason: str) -> None:
+    """Helper used by cancel_pipeline. Best-effort — must not raise."""
+    try:
+        started_at = (lock_info or {}).get("started_at") or ""
+        ended_at = datetime.now().isoformat(timespec="seconds")
+        duration_sec = None
+        try:
+            duration_sec = int(
+                (datetime.now() - datetime.fromisoformat(started_at)).total_seconds()
+            )
+        except Exception:
+            pass
+        append_run_history(case_id, {
+            "run_id":       _new_run_id(),
+            "case_id":      case_id,
+            "operation":    (lock_info or {}).get("operation") or "unknown",
+            "status":       "cancelled",
+            "started_at":   started_at or ended_at,
+            "ended_at":     ended_at,
+            "duration_sec": duration_sec,
+            "user":         getpass.getuser(),
+            "host":         socket.gethostname(),
+            "pid":          os.getpid(),
+            "subproc_pid":  killed_pid,
+            "start_step":   (lock_info or {}).get("start_step"),
+            "steps":        None,
+            "return_code":  None,
+            "message":      reason,
+        })
+    except Exception:
+        pass
 
 
 # ── Sidebar ──────────────────────────────────────────────────────────────────
@@ -1348,6 +1453,24 @@ if mode == "Select Existing Case":
             all_ok = True
             start_step = st.session_state.pipeline_start_step
 
+            # Phase 4.6J — record run start
+            _run_id = _new_run_id()
+            _run_started_at = datetime.now().isoformat(timespec="seconds")
+            _run_t0 = time.monotonic()
+            # Differentiate "pipeline" (full) vs "enrich_format_export" (start_step=1)
+            _run_op = "enrich_format_export" if start_step == 1 else "pipeline"
+            append_run_history(selected_case, {
+                "run_id":      _run_id,
+                "case_id":     selected_case,
+                "operation":   _run_op,
+                "status":      "started",
+                "started_at":  _run_started_at,
+                "user":        getpass.getuser(),
+                "host":        socket.gethostname(),
+                "pid":         os.getpid(),
+                "start_step":  start_step,
+            })
+
             try:
                 with st.status("Running pipeline…", expanded=True) as status:
                     for idx, step in enumerate(PIPELINE_STEPS):
@@ -1409,6 +1532,28 @@ if mode == "Select Existing Case":
             finally:
                 # Always release the lock — success, failed step, or unhandled exception.
                 release_lock(selected_case)
+
+            # Phase 4.6J — record terminal status (best-effort, after lock release)
+            _last = (st.session_state.pipeline_step_results[-1]
+                     if st.session_state.pipeline_step_results else {})
+            append_run_history(selected_case, {
+                "run_id":       _run_id,
+                "case_id":      selected_case,
+                "operation":    _run_op,
+                "status":       "success" if all_ok else "failed",
+                "started_at":   _run_started_at,
+                "ended_at":     datetime.now().isoformat(timespec="seconds"),
+                "duration_sec": int(time.monotonic() - _run_t0),
+                "user":         getpass.getuser(),
+                "host":         socket.gethostname(),
+                "pid":          os.getpid(),
+                "start_step":   start_step,
+                "steps":        [{"label": r["label"], "ok": r["ok"], "rc": r["rc"]}
+                                 for r in st.session_state.pipeline_step_results],
+                "return_code":  _last.get("rc"),
+                "message":      (_last.get("ok_msg") if all_ok
+                                 else f"failed at: {_last.get('label', '?')}"),
+            })
 
             st.session_state.pipeline_running = False
             if all_ok:
@@ -1475,6 +1620,29 @@ if _errors_path.exists():
             f"command line with `--retry-failed-chunks` to re-attempt them."
         )
 
+# Phase 4.6J — Recent runs preview (latest 5, collapsed by default)
+_recent_runs = read_run_history(selected_case, limit=5)
+if _recent_runs:
+    _STATUS_ICON = {
+        "success":   "✅",
+        "failed":    "❌",
+        "cancelled": "⏹",
+        "started":   "▶",
+    }
+    with st.expander(f"Recent runs ({len(_recent_runs)})", expanded=False):
+        for _r in _recent_runs:
+            _icon  = _STATUS_ICON.get(_r.get("status", ""), "·")
+            _t     = _r.get("ended_at") or _r.get("started_at") or "?"
+            _op    = _r.get("operation", "?")
+            _st_   = _r.get("status", "?")
+            _dur   = _r.get("duration_sec")
+            _dur_s = f" · {_dur}s" if isinstance(_dur, int) else ""
+            _msg   = _r.get("message") or ""
+            _msg_s = f" — {_msg}" if _msg else ""
+            st.markdown(
+                f"- {_icon} `{_t}` · **{_op}** · {_st_}{_dur_s}{_msg_s}"
+            )
+
 run_dir = RUNS_DIR / selected_case
 XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
@@ -1488,6 +1656,7 @@ ADVANCED_FILES = [
     ("requirements_clean.json",    "Requirements (clean)"),
     ("requirements.partial.jsonl", "Requirements (partial / resume)"),
     ("extract_errors.jsonl",       "Extraction errors (soft-fail log)"),
+    ("run_history.jsonl",          "Run history (Phase 4.6J)"),
     ("manifest.json",              "Manifest"),
 ]
 
@@ -1722,6 +1891,23 @@ if mode == "Select Existing Case":
                 ]
 
                 _all_ok = True
+
+                # Phase 4.6J — record normalize run start
+                _norm_run_id = _new_run_id()
+                _norm_started_at = datetime.now().isoformat(timespec="seconds")
+                _norm_t0 = time.monotonic()
+                append_run_history(selected_case, {
+                    "run_id":     _norm_run_id,
+                    "case_id":    selected_case,
+                    "operation":  "normalize",
+                    "status":     "started",
+                    "started_at": _norm_started_at,
+                    "user":       getpass.getuser(),
+                    "host":       socket.gethostname(),
+                    "pid":        os.getpid(),
+                    "start_step": 0,
+                })
+
                 try:
                     with st.status("Running normalize…", expanded=True) as _norm_status:
                         for _step in _NORMALIZE_STEPS:
@@ -1765,6 +1951,28 @@ if mode == "Select Existing Case":
                             )
                 finally:
                     release_lock(selected_case)
+
+                # Phase 4.6J — record normalize terminal status
+                _norm_last = (st.session_state.normalize_step_results[-1]
+                              if st.session_state.normalize_step_results else {})
+                append_run_history(selected_case, {
+                    "run_id":       _norm_run_id,
+                    "case_id":      selected_case,
+                    "operation":    "normalize",
+                    "status":       "success" if _all_ok else "failed",
+                    "started_at":   _norm_started_at,
+                    "ended_at":     datetime.now().isoformat(timespec="seconds"),
+                    "duration_sec": int(time.monotonic() - _norm_t0),
+                    "user":         getpass.getuser(),
+                    "host":         socket.gethostname(),
+                    "pid":          os.getpid(),
+                    "start_step":   0,
+                    "steps":        [{"label": r["label"], "ok": r["ok"], "rc": r["rc"]}
+                                     for r in st.session_state.normalize_step_results],
+                    "return_code":  _norm_last.get("rc"),
+                    "message":      ("normalize complete" if _all_ok
+                                     else f"failed at: {_norm_last.get('label', '?')}"),
+                })
 
                 st.session_state.normalize_running = False
                 st.rerun()
