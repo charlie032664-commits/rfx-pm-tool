@@ -208,7 +208,8 @@ def read_progress_counts(case_id: str) -> dict:
     return counts
 
 
-def run_step_streaming(cmd: list, on_line) -> tuple[int, str]:
+def run_step_streaming(cmd: list, on_line,
+                       case_id: str | None = None) -> tuple[int, str]:
     """Run a subprocess and stream stdout to on_line() line by line.
 
     Returns (returncode, combined_output_stripped). stderr is merged into
@@ -219,6 +220,10 @@ def run_step_streaming(cmd: list, on_line) -> tuple[int, str]:
 
     on_line is called with each non-empty stripped line. Exceptions raised
     by on_line are swallowed so a UI handler bug cannot crash the loop.
+
+    Phase 4.6I: when case_id is provided, the child's PID is published to
+    runs/<case_id>/.pipeline.subproc_pid for the lifetime of the child so a
+    Cancel handler in another session can find and kill it.
     """
     env = {**os.environ, "PYTHONUNBUFFERED": "1"}
     proc = subprocess.Popen(
@@ -231,6 +236,8 @@ def run_step_streaming(cmd: list, on_line) -> tuple[int, str]:
         errors="replace",
         env=env,
     )
+    if case_id:
+        _write_subproc_pid(case_id, proc.pid)
     buf: list[str] = []
     try:
         for line in iter(proc.stdout.readline, ""):
@@ -245,6 +252,8 @@ def run_step_streaming(cmd: list, on_line) -> tuple[int, str]:
     finally:
         proc.stdout.close()
         proc.wait()
+        if case_id:
+            _clear_subproc_pid(case_id)
     return proc.returncode, "".join(buf).strip()
 
 
@@ -606,6 +615,110 @@ def release_lock(case_id: str) -> None:
             p.unlink()
     except Exception:
         pass  # best-effort; another release path will catch it next time
+
+
+# Phase 4.6I — Subprocess PID sidecar for cancel-from-another-session.
+#
+# acquire_lock records the Streamlit master's PID, which is the right answer
+# for "who acquired the lock" but the wrong answer for "what to kill on cancel"
+# — the actual extract/enrich/normalize work happens in a child Popen.
+# We track the active child's PID in a sidecar file so a Cancel handler in
+# any session can find and kill the right process. The sidecar is short-lived:
+# created on Popen, removed in run_step_streaming's finally.
+
+def _subproc_pid_path(case_id: str) -> Path:
+    return RUNS_DIR / case_id / ".pipeline.subproc_pid"
+
+
+def _write_subproc_pid(case_id: str, pid: int) -> None:
+    p = _subproc_pid_path(case_id)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        p.write_text(str(int(pid)), encoding="utf-8")
+    except Exception:
+        pass  # cancel degrades to a no-op if we can't publish the pid
+
+
+def _read_subproc_pid(case_id: str) -> int | None:
+    p = _subproc_pid_path(case_id)
+    if not p.exists():
+        return None
+    try:
+        return int(p.read_text(encoding="utf-8").strip())
+    except Exception:
+        return None
+
+
+def _clear_subproc_pid(case_id: str) -> None:
+    p = _subproc_pid_path(case_id)
+    try:
+        if p.exists():
+            p.unlink()
+    except Exception:
+        pass
+
+
+def _kill_process_tree(pid: int | None) -> bool:
+    """Kill pid + descendants. Returns True if the process was alive when
+    we tried to kill it; False if it was already gone, invalid, or our own
+    pid (we refuse to suicide)."""
+    if pid is None:
+        return False
+    try:
+        pid_int = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid_int <= 0 or pid_int == os.getpid():
+        return False
+    if not _pid_alive(pid_int):
+        return False
+    if sys.platform == "win32":
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(pid_int)],
+                capture_output=True, timeout=10,
+            )
+        except Exception:
+            pass
+    else:
+        try:
+            import signal as _sig
+            os.killpg(os.getpgid(pid_int), _sig.SIGTERM)
+        except Exception:
+            try:
+                os.kill(pid_int, 9)
+            except Exception:
+                pass
+    return True
+
+
+def cancel_pipeline(case_id: str) -> dict:
+    """Cancel the case's active pipeline child and clean up lock + sidecar.
+
+    Safety: if the lock was acquired by a different host or user, refuses to
+    kill anything (the lock belongs to someone else). The lock itself is
+    left intact in that case so the rightful owner can still see / clear it.
+
+    Returns {"killed": bool, "reason": str}.
+    """
+    info = read_lock_info(case_id) or {}
+    if info.get("host") and info.get("host") != socket.gethostname():
+        return {"killed": False,
+                "reason": f"refuse: lock owned by host {info.get('host')!r}"}
+    if info.get("user") and info.get("user") != getpass.getuser():
+        return {"killed": False,
+                "reason": f"refuse: lock owned by user {info.get('user')!r}"}
+
+    pid = _read_subproc_pid(case_id)
+    killed = _kill_process_tree(pid) if pid else False
+    _clear_subproc_pid(case_id)
+    release_lock(case_id)
+
+    if killed:
+        return {"killed": True, "reason": f"killed PID {pid} and descendants"}
+    if pid is None:
+        return {"killed": False, "reason": "no active subprocess sidecar; lock cleared"}
+    return {"killed": False, "reason": f"PID {pid} already gone; lock cleared"}
 
 
 # ── Sidebar ──────────────────────────────────────────────────────────────────
@@ -1079,6 +1192,14 @@ if mode == "Select Existing Case":
     _lock_stale  = is_lock_stale(_lock_info) if _lock_info else False
     _lock_active = bool(_lock_info) and not _lock_stale
 
+    # Phase 4.6I — surface the result of a recent Cancel across the rerun
+    _cancel_msg = st.session_state.pop("_cancel_msg", None)
+    if _cancel_msg:
+        st.warning(
+            f"⏹ Pipeline cancelled by user. {_cancel_msg}. "
+            "Partial progress is preserved."
+        )
+
     if _lock_active:
         _li = _lock_info or {}
         _pid_val = _li.get("pid")
@@ -1103,6 +1224,23 @@ if mode == "Select Existing Case":
             f"start_step: `{_li.get('start_step', '?')}`"
             f"{_pid_dead_hint}"
         )
+
+        # Phase 4.6I — Cancel button (same-host/same-user only)
+        # Refresh this tab (or open another) while a long run is in progress
+        # to see this button; clicking it kills the running subprocess tree
+        # and clears the lock. partial.jsonl and prior outputs are preserved.
+        _can_cancel = (_li.get("host") == socket.gethostname()
+                       and _li.get("user") == getpass.getuser())
+        if _can_cancel and st.button(
+            "🛑 Cancel pipeline",
+            key=f"cancel_pipeline_{selected_case}",
+            help="Kill the running subprocess and clear the lock. "
+                 "Partial progress (requirements.partial.jsonl, "
+                 "extract_errors.jsonl, etc.) is preserved.",
+        ):
+            _result = cancel_pipeline(selected_case)
+            st.session_state["_cancel_msg"] = _result["reason"]
+            st.rerun()
     elif _lock_info and _lock_stale:
         _li = _lock_info
         if _li.get("_invalid"):
@@ -1237,7 +1375,8 @@ if mode == "Select Existing Case":
                         _t0 = time.monotonic()
                         _slots["elapsed"].markdown("⏱  elapsed: 0s  (running…)")
                         rc, output = run_step_streaming(
-                            step["cmd"], _make_on_line(_slots, _t0)
+                            step["cmd"], _make_on_line(_slots, _t0),
+                            case_id=selected_case,
                         )
                         _elapsed_final = int(time.monotonic() - _t0)
                         _slots["elapsed"].markdown(
@@ -1594,7 +1733,8 @@ if mode == "Select Existing Case":
                                 "⏱  elapsed: 0s  (running…)"
                             )
                             _rc, _out = run_step_streaming(
-                                _step["cmd"], _make_on_line(_slots, _t0)
+                                _step["cmd"], _make_on_line(_slots, _t0),
+                                case_id=selected_case,
                             )
                             _elapsed_final = int(time.monotonic() - _t0)
                             _slots["elapsed"].markdown(

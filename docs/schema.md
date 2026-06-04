@@ -596,7 +596,6 @@ produce.
 - LLM retry warning surface
 
 **Out of scope:**
-- Cancel / interrupt button
 - Persisted run history / per-run timeline export
 
 ---
@@ -679,3 +678,89 @@ verbatim:
 [OK] Partial saved: runs/<case>/requirements.partial.jsonl
 [WARN] <K> chunk(s) failed extraction; see runs/<case>/extract_errors.jsonl   ← only when K > 0
 ```
+
+---
+
+## Phase 4.6I — Cancel / interrupt button
+
+Long extract runs on big documents (a 2979-chunk spec, an LLM provider
+that is timing out, etc.) used to require the PM to find and `taskkill`
+the Python subprocess by hand. Phase 4.6I exposes a **Cancel** button in
+the UI that kills the running subprocess, cleans up the lock, and
+preserves all partial outputs.
+
+### Subprocess PID sidecar — `runs/<case_id>/.pipeline.subproc_pid`
+
+A short-lived companion to `.pipeline.lock`. Contains a single line: the
+PID of the currently-running extract / enrich / normalize child.
+
+- **Written** by `run_step_streaming(..., case_id=...)` immediately after
+  `subprocess.Popen` returns. The PID is the child process, **not** the
+  Streamlit master.
+- **Removed** by `run_step_streaming`'s `finally` block when the child
+  exits (normal completion, error, or cancel).
+- **Not** part of the lock schema — `acquire_lock` does not touch it, and
+  `is_lock_stale` does not consult it. The lock and the sidecar have
+  different lifetimes: the lock spans a whole pipeline (Extract → Enrich
+  → Format → Export), while the sidecar tracks **one step at a time**.
+
+### Cancel button — UI
+
+The Cancel button is rendered next to the active-lock banner in Step 2.
+It is visible **only** when both of:
+- `lock.host == socket.gethostname()`
+- `lock.user == getpass.getuser()`
+
+are true — a lock held by another host or user belongs to that operator
+and is not ours to cancel.
+
+Because Streamlit serializes script execution per session, the tab that
+clicked **Run Full Pipeline** is busy inside `run_step_streaming` and
+cannot process its own Cancel click. To cancel a run, **refresh the tab
+or open a second tab** for the same case — the fresh script run reads the
+lock, renders the Cancel button, and the click takes effect there.
+
+### Cancel behavior
+
+`cancel_pipeline(case_id)` performs the following, in order:
+
+1. Read the lock; if `host` or `user` does not match the current process,
+   refuse and return `{killed: False, reason: "refuse: ..."}` without
+   touching anything.
+2. Read the child PID from `.pipeline.subproc_pid` (if present).
+3. Call `_kill_process_tree(pid)` — on Windows this runs
+   `taskkill /F /T /PID <pid>` so the child and any grandchildren are
+   killed together; on POSIX it uses `os.killpg` then falls back to
+   `os.kill(pid, 9)`.
+4. Remove `.pipeline.subproc_pid`.
+5. Call `release_lock(case_id)` to remove `.pipeline.lock`.
+
+Safety guarantees in `_kill_process_tree`:
+- Returns `False` (no-op) for an invalid PID, our own PID, or a PID that
+  is already gone — so a Cancel click after the subprocess has finished
+  naturally is harmless.
+- Never raises — best-effort signalling.
+
+### What is preserved on cancel
+
+- `requirements.partial.jsonl` — every chunk that completed before the
+  cancel is still in the file. Re-running with `--resume` (the default)
+  skips them.
+- `extract_errors.jsonl` — any soft-failed chunk records survive.
+- `requirements.json` / `requirements_enriched.json` / `compliance_matrix.xlsx`
+  — only updated at the very end of their respective steps, so a
+  mid-step cancel leaves the previous version (if any) untouched.
+
+### UX feedback
+
+After cancel, the tab that clicked Cancel re-renders without the lock
+banner and shows:
+
+```
+⏹ Pipeline cancelled by user. killed PID <N> and descendants. Partial progress is preserved.
+```
+
+The tab that was running the pipeline sees its `run_step_streaming` loop
+exit naturally (the subprocess pipe closed), the streaming step records
+a non-zero `returncode`, the per-step `st.status` settles into the error
+state, and `release_lock` runs as a no-op (the lock is already gone).
