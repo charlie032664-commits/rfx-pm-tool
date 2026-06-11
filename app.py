@@ -162,6 +162,64 @@ def read_run_counts(case_id: str) -> dict:
     return counts
 
 
+def load_cache_summary(case_id: str) -> dict | None:
+    """Load the incremental-cache observability summary for a case, if present.
+
+    Produced by scripts/cache_metadata.py as runs/<case>/extraction_cache.json,
+    where the metrics live under the top-level "summary" key. Returns a flat
+    dict of the five summary metrics plus generated_at / model_name, or None
+    when the cache step has not been run for this case yet.
+
+    Backward-compatible by design: a missing or unreadable file simply returns
+    None, so the page renders exactly as it did before this feature existed.
+    A cache_summary.json fallback is accepted in case a later step writes the
+    summary object on its own.
+    """
+    run_dir = RUNS_DIR / case_id
+    for fname in ("extraction_cache.json", "cache_summary.json"):
+        p = run_dir / fname
+        if not p.exists():
+            continue
+        try:
+            doc = json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if not isinstance(doc, dict):
+            continue
+        summary = doc.get("summary")
+        if not isinstance(summary, dict):
+            # cache_summary.json may itself be the bare summary object.
+            summary = doc if "total_requirements" in doc else None
+        if not isinstance(summary, dict):
+            continue
+        return {
+            "total_requirements":          summary.get("total_requirements", 0),
+            "reused_from_cache":           summary.get("reused_from_cache", 0),
+            "reprocessed":                 summary.get("reprocessed", 0),
+            "skipped_unchanged":           summary.get("skipped_unchanged", 0),
+            "estimated_runtime_saved_sec": summary.get("estimated_runtime_saved_sec", 0),
+            "generated_at":                doc.get("generated_at", ""),
+            "model_name":                  doc.get("model_name", ""),
+        }
+    return None
+
+
+def _fmt_runtime_saved(sec) -> str:
+    """Human-readable duration for the runtime-saved card.
+
+    Mirrors extraction_cache._fmt_seconds; kept local so app.py needs no new
+    import. Non-numeric input renders as an em dash rather than raising.
+    """
+    try:
+        s = int(round(float(sec)))
+    except (TypeError, ValueError):
+        return "—"
+    if s < 60:
+        return f"{s}s"
+    m, r = divmod(s, 60)
+    return f"{m}m {r}s"
+
+
 def read_progress_counts(case_id: str) -> dict:
     """Merge pipeline statuses with saved responses to produce progress counts."""
     counts = {"COMPLIANT": 0, "PARTIAL": 0, "NON-COMPLIANT": 0,
@@ -1598,6 +1656,58 @@ if counts:
             "<p style='font-size:0.95rem;color:#546E7A;margin-top:4px;'>"
             "主表 = 交給客戶的 compliance_matrix 筆數</p>",
             unsafe_allow_html=True,
+        )
+
+# Phase 8C — Incremental cache summary (observability ONLY). This never skips
+# LLM work, never reuses old extraction output, and never changes extraction
+# behavior. It just displays runs/<case>/extraction_cache.json when present and
+# stays silent/empty otherwise (backward-compatible).
+with st.expander("Incremental Cache Summary", expanded=False):
+    # Optional, low-risk action first so freshly generated metrics render below
+    # in the same run. cache_metadata.py is report-only — it writes the
+    # gitignored runs/<case>/extraction_cache.json and touches no pipeline output.
+    if st.button("Generate cache summary", key=f"gen_cache_{selected_case}",
+                 help="Runs scripts/cache_metadata.py for this case (report-only — no LLM work)."):
+        _cache_script = AI_RFX_DIR / "cache_metadata.py"
+        if not _cache_script.exists():
+            st.error(f"Not found: {_cache_script}")
+        elif not (RUNS_DIR / selected_case / "requirements_clean.json").exists():
+            st.warning("requirements_clean.json missing — run the pipeline (Steps 1–3) first.")
+        else:
+            try:
+                _proc = subprocess.run(
+                    [PYTHON, str(_cache_script),
+                     "--case", selected_case, "--runs", str(RUNS_DIR)],
+                    capture_output=True, text=True, encoding="utf-8",
+                    errors="replace", timeout=120,
+                )
+                if _proc.returncode == 0:
+                    st.success("Cache summary generated.")
+                else:
+                    st.error(f"cache_metadata.py exited {_proc.returncode}")
+                if _proc.stdout:
+                    st.code(_proc.stdout, language="text")
+            except Exception as _e:
+                st.error(f"Failed to run cache_metadata.py: {_e}")
+
+    _cache = load_cache_summary(selected_case)
+    if _cache:
+        _cc = st.columns(5)
+        _cc[0].metric("Total requirements", _cache["total_requirements"])
+        _cc[1].metric("Reused from cache",  _cache["reused_from_cache"])
+        _cc[2].metric("Reprocessed",        _cache["reprocessed"])
+        _cc[3].metric("Skipped unchanged",  _cache["skipped_unchanged"])
+        _cc[4].metric("Est. runtime saved", _fmt_runtime_saved(_cache["estimated_runtime_saved_sec"]))
+        st.caption("Report-only. No LLM work is skipped yet.")
+        if _cache.get("generated_at"):
+            _meta_line = f"Generated: {_cache['generated_at']}"
+            if _cache.get("model_name"):
+                _meta_line += f" · model: {_cache['model_name']}"
+            st.caption(_meta_line)
+    else:
+        st.info(
+            "Cache summary not generated yet. "
+            "Run cache metadata step to view cache reuse estimate."
         )
 
 # Phase 4.6G — surface chunks that were soft-failed during extraction so PM
