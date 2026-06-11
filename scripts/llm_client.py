@@ -25,6 +25,23 @@ from typing import Any, Optional
 import httpx
 from openai import OpenAI
 
+# Central, best-effort .env load: every CLI entry point (extract / run_case /
+# normalize) imports this module, so loading here means a local .env is honoured
+# even for scripts that don't call load_env() themselves. OS env always wins and
+# a missing .env is a no-op; failures are swallowed so importing stays safe.
+try:
+    from env_loader import load_env as _load_env       # script-dir on sys.path
+except Exception:  # pragma: no cover - import-context dependent
+    try:
+        from scripts.env_loader import load_env as _load_env  # package context
+    except Exception:
+        _load_env = None
+if _load_env is not None:
+    try:
+        _load_env()
+    except Exception:
+        pass
+
 
 _DEFAULT_OPENAI_MODEL = "gpt-4.1-mini"
 _DEFAULT_TIMEOUT = 60.0
