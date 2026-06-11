@@ -13,6 +13,13 @@ import yaml
 from datetime import datetime, timedelta
 from pathlib import Path
 from scripts.responses_manager import ResponsesManager
+from scripts.env_loader import load_env
+
+# Load a repo-root .env (if present) into os.environ BEFORE any LLM-config
+# checks or subprocess launches. OS env always wins, so launchers / setx keep
+# precedence; a missing .env is a no-op. This is what lets the pipeline
+# subprocesses (which inherit os.environ) see local LLM settings.
+load_env()
 
 BASE_DIR       = Path(__file__).parent
 INBOUND_DIR    = BASE_DIR / "inbound"

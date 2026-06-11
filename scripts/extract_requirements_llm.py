@@ -38,6 +38,7 @@ sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 from llm_client import get_client, get_model, is_available, parse_json_response
 from file_selection import load_excluded   # Phase 7: enforce Step 1.5 exclusion
+from env_loader import load_env            # load local .env before LLM config check
 
 try:
     import docx  # python-docx
@@ -1295,6 +1296,11 @@ def main():
                     help="On resume, re-attempt chunks previously marked failed_chunk=true. "
                          "Default: skip them like any other completed chunk.")
     args = ap.parse_args()
+
+    # Load repo-root .env (if any) so a directly-launched extractor also picks
+    # up local LLM config. No-op when run from Streamlit (parent already loaded
+    # it) or when no .env exists; OS env always wins.
+    load_env()
 
     if not is_available():
         raise RuntimeError(

@@ -1,3 +1,9 @@
+# --- Local env (never commit real secrets); keep the template tracked ---
+.env
+.env.local
+*.env
+!.env.example
+
 # --- Python ---
 .venv/
 __pycache__/
