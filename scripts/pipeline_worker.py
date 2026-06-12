@@ -98,8 +98,10 @@ def main() -> int:
 
     load_env()
     scripts = Path(__file__).resolve().parent
-    case_dir = Path(args.case)
-    runs_root = Path(args.runs)
+    # Resolve to absolute so the sub-scripts (which resolve relative paths against
+    # their own dir) receive unambiguous paths regardless of the worker's cwd.
+    case_dir = Path(args.case).resolve()
+    runs_root = Path(args.runs).resolve()
     case_id = _resolve_case_id(case_dir, args.case_id)
     run_dir = runs_root / case_id
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -110,8 +112,14 @@ def main() -> int:
     provider = str(cfg.get("provider", "") or "")
     model = _resolve_model(provider)
 
-    stages = _build_stages(args.python, scripts, case_dir, runs_root, args.rules,
-                           args.responses, case_runs, args.max_chars, args.group_size)
+    _rules_abs = str(Path(args.rules).resolve())
+    _resp_abs = ""
+    if args.responses:
+        _rp = Path(args.responses).resolve()
+        if _rp.exists():
+            _resp_abs = str(_rp)
+    stages = _build_stages(args.python, scripts, case_dir, runs_root, _rules_abs,
+                           _resp_abs, case_runs, args.max_chars, args.group_size)
 
     job = js.start_job(run_dir, case_id=case_id, provider=provider, model=model,
                        log_path=str(log_path), pid=os.getpid(),
