@@ -13,7 +13,7 @@ import yaml
 from datetime import datetime, timedelta
 from pathlib import Path
 from scripts.responses_manager import ResponsesManager
-from scripts.env_loader import load_env
+from scripts.env_loader import load_env, describe_llm_config
 
 # Load a repo-root .env (if present) into os.environ BEFORE any LLM-config
 # checks or subprocess launches. OS env always wins, so launchers / setx keep
@@ -955,6 +955,30 @@ else:
             create_case(selected_case, new_customer.strip(), new_language, new_status)
             st.sidebar.success(f"Case '{selected_case}' created.")
             st.rerun()
+
+
+# ── LLM provider status (v1.2): presence-only, never prints secret values ─────
+with st.sidebar.expander("LLM provider", expanded=False):
+    try:
+        _llm_cfg  = describe_llm_config()
+        _prov     = str(_llm_cfg.get("provider", "?"))
+        _ready    = bool(_llm_cfg.get("ready"))
+        _present  = _llm_cfg.get("present", {}) or {}
+        if _prov == "internal":
+            _model = os.environ.get("INTERNAL_LLM_MODEL", "") or "(unset)"
+        else:
+            _model = os.environ.get("OPENAI_MODEL", "") or "gpt-4.1-mini"
+        st.markdown(f"**Provider:** `{_prov}`")
+        st.markdown(f"**Model:** `{_model}`")
+        for _k, _ok in _present.items():
+            st.markdown(f"- `{_k}`: {'✅ present' if _ok else '❌ missing'}")
+        if _ready:
+            st.success("ready")
+        else:
+            st.warning("not ready — see docs/env_config.md")
+        st.caption("Presence only — no secret values are shown.")
+    except Exception:
+        st.caption("LLM status unavailable.")
 
 
 # ── Main area ─────────────────────────────────────────────────────────────────
