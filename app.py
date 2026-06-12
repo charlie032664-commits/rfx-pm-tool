@@ -228,6 +228,44 @@ def _fmt_runtime_saved(sec) -> str:
     return f"{m}m {r}s"
 
 
+def _launch_pipeline_worker(case_id: str, start_step: int = 0):
+    """v1.2: start scripts/pipeline_worker.py DETACHED so a Streamlit rerun can't
+    interrupt it. The worker writes runs/<case>/job_status.json + pipeline_worker.log
+    itself; we only need its pid. Returns the pid, or None on failure."""
+    case_inbound = INBOUND_DIR / case_id
+    responses    = RESPONSES_DIR / case_id / "responses.json"
+    cmd = [PYTHON, str(AI_RFX_DIR / "pipeline_worker.py"),
+           "--case", str(case_inbound), "--runs", str(RUNS_DIR),
+           "--rules", str(BASE_DIR / "rules"), "--start-step", str(start_step)]
+    if responses.exists():
+        cmd += ["--responses", str(responses)]
+    flags = 0
+    if sys.platform == "win32":
+        flags = getattr(subprocess, "DETACHED_PROCESS", 0x00000008) | subprocess.CREATE_NEW_PROCESS_GROUP
+    try:
+        proc = subprocess.Popen(
+            cmd, creationflags=flags,
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            close_fds=True, cwd=str(BASE_DIR),
+            env={**os.environ, "PYTHONUNBUFFERED": "1"},
+        )
+        return proc.pid
+    except Exception:
+        return None
+
+
+def _job_active(case_id: str) -> bool:
+    """True only if job_status says running AND that pid is still alive."""
+    j = read_job_status(RUNS_DIR / case_id)
+    if not j or j.get("status") != "running":
+        return False
+    pid = j.get("pid")
+    try:
+        return _pid_alive(int(pid)) if pid is not None else False
+    except Exception:
+        return False
+
+
 def read_progress_counts(case_id: str) -> dict:
     """Merge pipeline statuses with saved responses to produce progress counts."""
     counts = {"COMPLIANT": 0, "PARTIAL": 0, "NON-COMPLIANT": 0,
@@ -1602,6 +1640,37 @@ if mode == "Select Existing Case":
         partial_path.unlink()
         st.success("Partial cleared — next Full Pipeline will re-extract from scratch.")
         st.rerun()
+
+    # ── v1.2: detached background launch (beta) — additive. The synchronous
+    #    "Run Full Pipeline" above is unchanged and remains the default; this
+    #    starts a detached worker that survives page refresh / rerun. ──
+    st.markdown(
+        "<p style='font-size:0.9rem;color:#546E7A;margin:6px 0 2px 0;'>"
+        "Beta: run as a detached background job that survives page refresh.</p>",
+        unsafe_allow_html=True,
+    )
+    if st.session_state.get("_bg_started_msg"):
+        st.success(st.session_state.pop("_bg_started_msg"))
+    _bg_active = _job_active(selected_case)
+    if st.button(
+        "🚀 Run Full Pipeline in background (beta)",
+        key=f"run_bg_{selected_case}",
+        disabled=(_lock_active or _bg_active),
+        help="Starts scripts/pipeline_worker.py detached. Writes "
+             "runs/<case>/job_status.json + pipeline_worker.log; survives reruns.",
+    ):
+        _pid = _launch_pipeline_worker(selected_case, 0)
+        if _pid:
+            st.session_state["_bg_started_msg"] = (
+                f"Pipeline started in background (pid {_pid}). "
+                "You may refresh this page; job status updates below."
+            )
+        else:
+            st.session_state["_bg_started_msg"] = "⚠ Failed to start background worker."
+        st.rerun()
+    if _bg_active:
+        st.info("A background pipeline job appears to be running for this case "
+                "(see job status below).")
 
     # ── Running banner (visible while executing) ──
     if st.session_state.pipeline_running:
