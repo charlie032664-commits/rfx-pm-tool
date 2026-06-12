@@ -14,6 +14,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from scripts.responses_manager import ResponsesManager
 from scripts.env_loader import load_env, describe_llm_config
+from scripts.job_status import start_job, set_stage, finish_job, read_job_status
 
 # Load a repo-root .env (if present) into os.environ BEFORE any LLM-config
 # checks or subprocess launches. OS env always wins, so launchers / setx keep
@@ -1648,6 +1649,24 @@ if mode == "Select Existing Case":
                 "start_step":  start_step,
             })
 
+            # v1.2: persistent job status (best-effort; never breaks the run)
+            _job_id = None
+            try:
+                _jcfg   = describe_llm_config()
+                _jprov  = str(_jcfg.get("provider", "") or "")
+                _jmodel = (os.environ.get("INTERNAL_LLM_MODEL", "") if _jprov == "internal"
+                           else (os.environ.get("OPENAI_MODEL", "") or "gpt-4.1-mini"))
+                _job = start_job(
+                    RUNS_DIR / selected_case,
+                    case_id=selected_case, provider=_jprov, model=_jmodel,
+                    log_path=str(RUNS_DIR / selected_case / "run_history.jsonl"),
+                    pid=os.getpid(),
+                    stage=("enrich" if start_step == 1 else "extract"),
+                )
+                _job_id = _job["job_id"]
+            except Exception:
+                _job_id = None
+
             try:
                 with st.status("Running pipeline…", expanded=True) as status:
                     for idx, step in enumerate(PIPELINE_STEPS):
@@ -1669,6 +1688,15 @@ if mode == "Select Existing Case":
                             )
                             all_ok = False
                             break
+
+                        # v1.2: advance persistent job stage (best-effort)
+                        if _job_id:
+                            try:
+                                _STAGES = ["extract", "enrich", "format", "export"]
+                                set_stage(RUNS_DIR / selected_case, _job_id,
+                                          _STAGES[idx] if idx < len(_STAGES) else "export")
+                            except Exception:
+                                pass
 
                         st.write(f"▶  {label}…")
                         _slots = _make_progress_slots()
@@ -1732,6 +1760,17 @@ if mode == "Select Existing Case":
                                  else f"failed at: {_last.get('label', '?')}"),
             })
 
+            # v1.2: persistent job terminal status (best-effort; helper masks secrets)
+            if _job_id:
+                try:
+                    if all_ok:
+                        finish_job(RUNS_DIR / selected_case, _job_id, "success")
+                    else:
+                        finish_job(RUNS_DIR / selected_case, _job_id, "failed",
+                                   error=f"failed at: {_last.get('label', '?')}")
+                except Exception:
+                    pass
+
             st.session_state.pipeline_running = False
             if all_ok:
                 st.session_state.pipeline_done = True
@@ -1751,6 +1790,25 @@ if mode == "Select Existing Case":
         last = st.session_state.pipeline_step_results[-1]
         if not last["ok"]:
             st.error("🛑  Pipeline stopped. Review the log above, fix the issue, and retry.")
+
+    # ── v1.2: persistent job status readback (state only, no secrets) ──
+    _jobst = read_job_status(RUNS_DIR / selected_case)
+    if _jobst:
+        with st.expander("Pipeline job status (persistent)", expanded=False):
+            st.markdown(
+                f"- **status:** `{_jobst.get('status','?')}` · "
+                f"**stage:** `{_jobst.get('stage','?')}`\n"
+                f"- **provider / model:** `{_jobst.get('provider','?')}` / "
+                f"`{_jobst.get('model','?')}`\n"
+                f"- **started:** `{_jobst.get('started_at','?')}` · "
+                f"**ended:** `{_jobst.get('ended_at') or '—'}`\n"
+                f"- **job_id:** `{_jobst.get('job_id','?')}` · "
+                f"**pid:** `{_jobst.get('pid','—')}`\n"
+                f"- **log_path:** `{_jobst.get('log_path','—')}`"
+            )
+            if _jobst.get("error"):
+                st.warning(f"error: {_jobst['error']}")
+            st.caption("From runs/<case>/job_status.json — survives reruns; no secrets shown.")
 
     st.divider()
 
