@@ -1671,6 +1671,22 @@ if mode == "Select Existing Case":
     if _bg_active:
         st.info("A background pipeline job appears to be running for this case "
                 "(see job status below).")
+    else:
+        # v1.2 Phase 4: stale job detection — status=running but the pid is dead.
+        # Read-only guidance; never auto-deletes locks or outputs.
+        _js = read_job_status(RUNS_DIR / selected_case)
+        if _js and _js.get("status") == "running":
+            _lock_note = (" A `.pipeline.lock` is also present — use the lock "
+                          "controls above to clear it if needed."
+                          if (RUNS_DIR / selected_case / ".pipeline.lock").exists() else "")
+            st.warning(
+                f"⚠ A job is marked **running** (stage `{_js.get('stage','?')}`, "
+                f"job_id `{_js.get('job_id','?')}`, pid `{_js.get('pid')}`) but that "
+                "process is no longer alive — the previous background run likely "
+                "stopped without a terminal status. Outputs (if any) are preserved; "
+                "you can safely start a new run (the status will be overwritten). "
+                "No files were deleted." + _lock_note
+            )
 
     # ── Running banner (visible while executing) ──
     if st.session_state.pipeline_running:
