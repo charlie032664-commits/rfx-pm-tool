@@ -56,3 +56,20 @@ python scripts/env_loader.py
 Prints the provider, whether each required variable is **present** (never its
 value), and a final `ready` flag. Use this to confirm the config is complete
 before launching the Full Pipeline.
+
+## Launchers
+
+| Launcher | Use when | Behavior |
+|----------|----------|----------|
+| `run_rfx.bat` | **Recommended / normal.** Config in `.env` or OS env (OpenAI **or** internal). | Does not force a provider; Streamlit loads `.env` at startup and OS env / `.env` decide everything. |
+| `run_rfx_internal.bat` | Internal-only, config in **Windows env (`setx`)** or hardcoded in the launcher. | Forces `LLM_PROVIDER=internal` and **fails fast** if `INTERNAL_LLM_BASE_URL` / `INTERNAL_LLM_API_KEY` / `INTERNAL_LLM_MODEL` are missing — Streamlit never starts in a broken state. |
+
+Notes:
+- **OS env takes precedence over `.env`.** A variable already exported (e.g. via
+  `setx`) is used even if `.env` sets a different value.
+- `run_rfx_internal.bat` checks the **process environment only** (it does not read
+  `.env`). If you configure the internal endpoint via a local `.env`, use
+  `run_rfx.bat` instead.
+- `run_rfx_internal.bat --check` runs the config check and exits **without**
+  starting Streamlit (exit code `0` = complete, `1` = incomplete).
+- `.env` must never be committed (it is gitignored; only `.env.example` is tracked).
