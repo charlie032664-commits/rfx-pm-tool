@@ -1573,6 +1573,41 @@ if mode == "Select Existing Case":
         unsafe_allow_html=True,
     )
 
+    # ── v1.3: runtime estimate / large-run guard (on-demand; reads files, no LLM) ──
+    with st.expander("⏱ Runtime estimate / large-run guard", expanded=False):
+        st.caption("Estimates extract runtime from file size + chunking for the "
+                   "current provider. No LLM call. Enrich adds ~1 call per requirement.")
+        if st.button("Estimate runtime", key=f"estimate_rt_{selected_case}"):
+            try:
+                _eprov = str(describe_llm_config().get("provider", "") or "")
+                _emodel = (os.environ.get("INTERNAL_LLM_MODEL", "") if _eprov == "internal"
+                           else (os.environ.get("OPENAI_MODEL", "") or "gpt-4.1-mini"))
+                import scripts.runtime_estimator as _rte
+                st.session_state[f"_rt_est_{selected_case}"] = _rte.estimate_case(
+                    INBOUND_DIR / selected_case, _eprov, _emodel)
+            except Exception as _e:
+                st.session_state[f"_rt_est_{selected_case}"] = {"error": str(_e)}
+        _est = st.session_state.get(f"_rt_est_{selected_case}")
+        if _est:
+            if _est.get("error"):
+                st.warning(f"Estimate unavailable: {_est['error']}")
+            else:
+                _c = st.columns(4)
+                _c[0].metric("Files",        _est.get("file_count", 0))
+                _c[1].metric("Est. chunks",  _est.get("chunks", 0))
+                _c[2].metric("Est. runtime", _est.get("est_runtime_human", "?"))
+                _c[3].metric("Risk",         str(_est.get("risk", "?")).upper())
+                st.caption(
+                    f"provider `{_est.get('provider','?')}` · model "
+                    f"`{_est.get('model') or '(default)'}` · "
+                    f"{_est.get('seconds_per_call','?')}s/call · {_est.get('note','')}"
+                )
+                if _est.get("risk") == "high":
+                    st.error("⛔ STRONG WARNING: estimated > 4 hours. For large internal "
+                             "runs, prefer OpenAI or run overnight with explicit intent.")
+                elif _est.get("risk") == "warning":
+                    st.warning("⚠ Estimated > 1 hour — this will take a while.")
+
     # Confirmation checkbox gates Run Full Pipeline whenever prior state
     # suggests re-extraction is expensive or unnecessary.
     _need_confirm = req_json_exists or _est_chunks > 300
