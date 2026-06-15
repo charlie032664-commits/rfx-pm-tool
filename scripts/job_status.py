@@ -119,10 +119,15 @@ def start_job(
     log_path: str = "",
     pid: Optional[int] = None,
     stage: str = "extract",
+    job_id: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Create a new running job, persist it, append a history line."""
+    """Create a new running job, persist it, append a history line.
+
+    Pass job_id to reuse an externally-generated id (e.g. so a pipeline lock and
+    the job status share one id); defaults to a fresh random id.
+    """
     job = {
-        "job_id": new_job_id(),
+        "job_id": job_id or new_job_id(),
         "case_id": case_id,
         "provider": provider,
         "model": model,

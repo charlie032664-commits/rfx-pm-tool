@@ -19,10 +19,13 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import getpass
+import json
 import os
+import socket
 import subprocess
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -35,6 +38,83 @@ STAGE_ORDER = ["extract", "enrich", "format", "export"]
 
 def _now() -> str:
     return datetime.now().isoformat(timespec="seconds")
+
+
+# ---------------------------------------------------------------------------
+# Pipeline lock — mirrors app.py's runs/<case>/.pipeline.lock protocol exactly so
+# background worker and synchronous Streamlit runs are mutually exclusive.
+# Stale rule: invalid / unparseable started_at / age > PIPELINE_LOCK_STALE_HOURS.
+# ---------------------------------------------------------------------------
+PIPELINE_LOCK_STALE_HOURS = 2
+
+
+def _lock_path(run_dir: Path) -> Path:
+    return Path(run_dir) / ".pipeline.lock"
+
+
+def _read_lock_info(run_dir: Path):
+    p = _lock_path(run_dir)
+    if not p.exists():
+        return None
+    try:
+        info = json.loads(p.read_text(encoding="utf-8"))
+        return info if isinstance(info, dict) else {"_invalid": True, "reason": "not a JSON object"}
+    except Exception as e:
+        return {"_invalid": True, "reason": f"unreadable: {e}"}
+
+
+def _is_lock_stale(info) -> bool:
+    if not info:
+        return False
+    if info.get("_invalid"):
+        return True
+    try:
+        age = datetime.now() - datetime.fromisoformat(info.get("started_at", ""))
+    except Exception:
+        return True
+    return age > timedelta(hours=PIPELINE_LOCK_STALE_HOURS)
+
+
+def _acquire_lock(run_dir: Path, case_id: str, start_step: int, job_id: str):
+    """Create .pipeline.lock. Refuse (None) if an active lock exists; replace a
+    stale/invalid one (same policy as app.py.acquire_lock). Atomic create ("x")."""
+    p = _lock_path(run_dir)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    if p.exists():
+        existing = _read_lock_info(run_dir)
+        if existing and not _is_lock_stale(existing):
+            return None  # active lock held by another run — do not touch it
+        try:
+            p.unlink()  # stale/invalid only
+        except Exception:
+            pass
+    info = {
+        "case_id":    case_id,
+        "started_at": _now(),
+        "pid":        os.getpid(),
+        "host":       socket.gethostname(),
+        "user":       getpass.getuser(),
+        "start_step": int(start_step),
+        "operation":  "pipeline",
+        "job_id":     job_id,
+        "launcher":   "background_worker",
+    }
+    try:
+        with open(p, "x", encoding="utf-8") as f:
+            f.write(json.dumps(info, ensure_ascii=False, indent=2))
+        return info
+    except FileExistsError:
+        return None
+
+
+def _release_lock(run_dir: Path) -> None:
+    """Delete .pipeline.lock if present. Idempotent; never raises."""
+    p = _lock_path(run_dir)
+    try:
+        if p.exists():
+            p.unlink()
+    except Exception:
+        pass
 
 
 def _resolve_model(provider: str) -> str:
@@ -121,14 +201,37 @@ def main() -> int:
     stages = _build_stages(args.python, scripts, case_dir, runs_root, _rules_abs,
                            _resp_abs, case_runs, args.max_chars, args.group_size)
 
-    job = js.start_job(run_dir, case_id=case_id, provider=provider, model=model,
-                       log_path=str(log_path), pid=os.getpid(),
-                       stage=("enrich" if args.start_step == 1 else "extract"))
-    jid = job["job_id"]
+    # Acquire the pipeline lock BEFORE any work so a background worker and a
+    # synchronous Streamlit run can never overlap for the same case.
+    job_id = js.new_job_id()
+    if _acquire_lock(run_dir, case_id, args.start_step, job_id) is None:
+        _msg = "could not acquire pipeline lock — another run is active for this case"
+        try:
+            with log_path.open("a", encoding="utf-8") as lf:
+                lf.write(f"[{_now()}] LOCK_REFUSED {_msg}\n")
+        except Exception:
+            pass
+        # Record a failed job only if it won't clobber the active run's status.
+        _cur = js.read_job_status(run_dir)
+        if not (_cur and _cur.get("status") == "running"):
+            try:
+                js.start_job(run_dir, case_id=case_id, provider=provider, model=model,
+                             log_path=str(log_path), pid=os.getpid(),
+                             stage=("enrich" if args.start_step == 1 else "extract"),
+                             job_id=job_id)
+                js.finish_job(run_dir, job_id, "failed", error=_msg)
+            except Exception:
+                pass
+        return 2  # locked / refused
 
+    jid = job_id
     rc_final = 0
     failed_stage = None
     try:
+        js.start_job(run_dir, case_id=case_id, provider=provider, model=model,
+                     log_path=str(log_path), pid=os.getpid(),
+                     stage=("enrich" if args.start_step == 1 else "extract"),
+                     job_id=job_id)
         with log_path.open("a", encoding="utf-8") as logf:
             def w(msg: str) -> None:
                 logf.write(f"[{_now()}] {msg}\n")
@@ -180,6 +283,7 @@ def main() -> int:
                     lf.write(f"[{_now()}] PIPELINE_FAILED at {failed_stage} rc={rc_final}\n")
         except Exception:
             pass
+        _release_lock(run_dir)  # release on success, failure, or exception
 
     return 0 if rc_final == 0 else (rc_final if isinstance(rc_final, int) and rc_final != 0 else 1)
 
