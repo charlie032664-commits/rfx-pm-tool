@@ -13,7 +13,8 @@ import yaml
 from datetime import datetime, timedelta
 from pathlib import Path
 from scripts.responses_manager import ResponsesManager
-from scripts.env_loader import load_env
+from scripts.env_loader import load_env, describe_llm_config
+from scripts.job_status import start_job, set_stage, finish_job, read_job_status
 
 # Load a repo-root .env (if present) into os.environ BEFORE any LLM-config
 # checks or subprocess launches. OS env always wins, so launchers / setx keep
@@ -225,6 +226,44 @@ def _fmt_runtime_saved(sec) -> str:
         return f"{s}s"
     m, r = divmod(s, 60)
     return f"{m}m {r}s"
+
+
+def _launch_pipeline_worker(case_id: str, start_step: int = 0):
+    """v1.2: start scripts/pipeline_worker.py DETACHED so a Streamlit rerun can't
+    interrupt it. The worker writes runs/<case>/job_status.json + pipeline_worker.log
+    itself; we only need its pid. Returns the pid, or None on failure."""
+    case_inbound = INBOUND_DIR / case_id
+    responses    = RESPONSES_DIR / case_id / "responses.json"
+    cmd = [PYTHON, str(AI_RFX_DIR / "pipeline_worker.py"),
+           "--case", str(case_inbound), "--runs", str(RUNS_DIR),
+           "--rules", str(BASE_DIR / "rules"), "--start-step", str(start_step)]
+    if responses.exists():
+        cmd += ["--responses", str(responses)]
+    flags = 0
+    if sys.platform == "win32":
+        flags = getattr(subprocess, "DETACHED_PROCESS", 0x00000008) | subprocess.CREATE_NEW_PROCESS_GROUP
+    try:
+        proc = subprocess.Popen(
+            cmd, creationflags=flags,
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            close_fds=True, cwd=str(BASE_DIR),
+            env={**os.environ, "PYTHONUNBUFFERED": "1"},
+        )
+        return proc.pid
+    except Exception:
+        return None
+
+
+def _job_active(case_id: str) -> bool:
+    """True only if job_status says running AND that pid is still alive."""
+    j = read_job_status(RUNS_DIR / case_id)
+    if not j or j.get("status") != "running":
+        return False
+    pid = j.get("pid")
+    try:
+        return _pid_alive(int(pid)) if pid is not None else False
+    except Exception:
+        return False
 
 
 def read_progress_counts(case_id: str) -> dict:
@@ -957,6 +996,30 @@ else:
             st.rerun()
 
 
+# ── LLM provider status (v1.2): presence-only, never prints secret values ─────
+with st.sidebar.expander("LLM provider", expanded=False):
+    try:
+        _llm_cfg  = describe_llm_config()
+        _prov     = str(_llm_cfg.get("provider", "?"))
+        _ready    = bool(_llm_cfg.get("ready"))
+        _present  = _llm_cfg.get("present", {}) or {}
+        if _prov == "internal":
+            _model = os.environ.get("INTERNAL_LLM_MODEL", "") or "(unset)"
+        else:
+            _model = os.environ.get("OPENAI_MODEL", "") or "gpt-4.1-mini"
+        st.markdown(f"**Provider:** `{_prov}`")
+        st.markdown(f"**Model:** `{_model}`")
+        for _k, _ok in _present.items():
+            st.markdown(f"- `{_k}`: {'✅ present' if _ok else '❌ missing'}")
+        if _ready:
+            st.success("ready")
+        else:
+            st.warning("not ready — see docs/env_config.md")
+        st.caption("Presence only — no secret values are shown.")
+    except Exception:
+        st.caption("LLM status unavailable.")
+
+
 # ── Main area ─────────────────────────────────────────────────────────────────
 
 st.title("RFX PM Tool")
@@ -1578,6 +1641,53 @@ if mode == "Select Existing Case":
         st.success("Partial cleared — next Full Pipeline will re-extract from scratch.")
         st.rerun()
 
+    # ── v1.2: detached background launch (beta) — additive. The synchronous
+    #    "Run Full Pipeline" above is unchanged and remains the default; this
+    #    starts a detached worker that survives page refresh / rerun. ──
+    st.markdown(
+        "<p style='font-size:0.9rem;color:#546E7A;margin:6px 0 2px 0;'>"
+        "Beta: run as a detached background job that survives page refresh.</p>",
+        unsafe_allow_html=True,
+    )
+    if st.session_state.get("_bg_started_msg"):
+        st.success(st.session_state.pop("_bg_started_msg"))
+    _bg_active = _job_active(selected_case)
+    if st.button(
+        "🚀 Run Full Pipeline in background (beta)",
+        key=f"run_bg_{selected_case}",
+        disabled=(_lock_active or _bg_active),
+        help="Starts scripts/pipeline_worker.py detached. Writes "
+             "runs/<case>/job_status.json + pipeline_worker.log; survives reruns.",
+    ):
+        _pid = _launch_pipeline_worker(selected_case, 0)
+        if _pid:
+            st.session_state["_bg_started_msg"] = (
+                f"Pipeline started in background (pid {_pid}). "
+                "You may refresh this page; job status updates below."
+            )
+        else:
+            st.session_state["_bg_started_msg"] = "⚠ Failed to start background worker."
+        st.rerun()
+    if _bg_active:
+        st.info("A background pipeline job appears to be running for this case "
+                "(see job status below).")
+    else:
+        # v1.2 Phase 4: stale job detection — status=running but the pid is dead.
+        # Read-only guidance; never auto-deletes locks or outputs.
+        _js = read_job_status(RUNS_DIR / selected_case)
+        if _js and _js.get("status") == "running":
+            _lock_note = (" A `.pipeline.lock` is also present — use the lock "
+                          "controls above to clear it if needed."
+                          if (RUNS_DIR / selected_case / ".pipeline.lock").exists() else "")
+            st.warning(
+                f"⚠ A job is marked **running** (stage `{_js.get('stage','?')}`, "
+                f"job_id `{_js.get('job_id','?')}`, pid `{_js.get('pid')}`) but that "
+                "process is no longer alive — the previous background run likely "
+                "stopped without a terminal status. Outputs (if any) are preserved; "
+                "you can safely start a new run (the status will be overwritten). "
+                "No files were deleted." + _lock_note
+            )
+
     # ── Running banner (visible while executing) ──
     if st.session_state.pipeline_running:
         st.info("🔄  Pipeline is running… Do not close this tab.")
@@ -1624,6 +1734,24 @@ if mode == "Select Existing Case":
                 "start_step":  start_step,
             })
 
+            # v1.2: persistent job status (best-effort; never breaks the run)
+            _job_id = None
+            try:
+                _jcfg   = describe_llm_config()
+                _jprov  = str(_jcfg.get("provider", "") or "")
+                _jmodel = (os.environ.get("INTERNAL_LLM_MODEL", "") if _jprov == "internal"
+                           else (os.environ.get("OPENAI_MODEL", "") or "gpt-4.1-mini"))
+                _job = start_job(
+                    RUNS_DIR / selected_case,
+                    case_id=selected_case, provider=_jprov, model=_jmodel,
+                    log_path=str(RUNS_DIR / selected_case / "run_history.jsonl"),
+                    pid=os.getpid(),
+                    stage=("enrich" if start_step == 1 else "extract"),
+                )
+                _job_id = _job["job_id"]
+            except Exception:
+                _job_id = None
+
             try:
                 with st.status("Running pipeline…", expanded=True) as status:
                     for idx, step in enumerate(PIPELINE_STEPS):
@@ -1645,6 +1773,15 @@ if mode == "Select Existing Case":
                             )
                             all_ok = False
                             break
+
+                        # v1.2: advance persistent job stage (best-effort)
+                        if _job_id:
+                            try:
+                                _STAGES = ["extract", "enrich", "format", "export"]
+                                set_stage(RUNS_DIR / selected_case, _job_id,
+                                          _STAGES[idx] if idx < len(_STAGES) else "export")
+                            except Exception:
+                                pass
 
                         st.write(f"▶  {label}…")
                         _slots = _make_progress_slots()
@@ -1708,6 +1845,17 @@ if mode == "Select Existing Case":
                                  else f"failed at: {_last.get('label', '?')}"),
             })
 
+            # v1.2: persistent job terminal status (best-effort; helper masks secrets)
+            if _job_id:
+                try:
+                    if all_ok:
+                        finish_job(RUNS_DIR / selected_case, _job_id, "success")
+                    else:
+                        finish_job(RUNS_DIR / selected_case, _job_id, "failed",
+                                   error=f"failed at: {_last.get('label', '?')}")
+                except Exception:
+                    pass
+
             st.session_state.pipeline_running = False
             if all_ok:
                 st.session_state.pipeline_done = True
@@ -1727,6 +1875,25 @@ if mode == "Select Existing Case":
         last = st.session_state.pipeline_step_results[-1]
         if not last["ok"]:
             st.error("🛑  Pipeline stopped. Review the log above, fix the issue, and retry.")
+
+    # ── v1.2: persistent job status readback (state only, no secrets) ──
+    _jobst = read_job_status(RUNS_DIR / selected_case)
+    if _jobst:
+        with st.expander("Pipeline job status (persistent)", expanded=False):
+            st.markdown(
+                f"- **status:** `{_jobst.get('status','?')}` · "
+                f"**stage:** `{_jobst.get('stage','?')}`\n"
+                f"- **provider / model:** `{_jobst.get('provider','?')}` / "
+                f"`{_jobst.get('model','?')}`\n"
+                f"- **started:** `{_jobst.get('started_at','?')}` · "
+                f"**ended:** `{_jobst.get('ended_at') or '—'}`\n"
+                f"- **job_id:** `{_jobst.get('job_id','?')}` · "
+                f"**pid:** `{_jobst.get('pid','—')}`\n"
+                f"- **log_path:** `{_jobst.get('log_path','—')}`"
+            )
+            if _jobst.get("error"):
+                st.warning(f"error: {_jobst['error']}")
+            st.caption("From runs/<case>/job_status.json — survives reruns; no secrets shown.")
 
     st.divider()
 
