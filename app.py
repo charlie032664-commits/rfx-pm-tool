@@ -1612,8 +1612,62 @@ if mode == "Select Existing Case":
 
     st.subheader("Step 3: Analyze RFQ")
     st.caption(
-        "Run AI extraction/enrichment and monitor progress. Fast UI Test / No-AI is planned for a later phase and is not wired here yet."
+        "Run AI extraction/enrichment and monitor progress. The Fast UI Test / "
+        "No-AI option below runs a heuristic mock for workflow testing only."
     )
+
+    # ── v1.4 Phase B: Fast UI Test / No-AI — workflow testing only. Runs the
+    # existing heuristic mock CLI (scripts/mock_extract_requirements.py). It does
+    # NOT call the LLM, NOT run the formal pipeline, and writes only a separate
+    # requirements_mock.json (never requirements.json / _clean.json / the matrix).
+    with st.expander("Fast UI Test / No-AI", expanded=False):
+        st.caption(
+            "For UI flow testing only. This does NOT call the LLM and does NOT run "
+            "the formal pipeline. Output is a heuristic mock — NOT final RFQ "
+            "extraction quality."
+        )
+        if st.button("Run No-AI Flow Test", key=f"noai_flow_{selected_case}",
+                     help="Runs scripts/mock_extract_requirements.py — heuristic, no LLM, no pipeline."):
+            _mock_script = AI_RFX_DIR / "mock_extract_requirements.py"
+            _mock_case = INBOUND_DIR / selected_case
+            _mock_out = RUNS_DIR / selected_case / "requirements_mock.json"
+            if not _mock_script.exists():
+                st.error(f"Not found: {_mock_script}")
+            elif not _mock_case.exists():
+                st.warning("No inbound folder for this case.")
+            else:
+                try:
+                    _mp = subprocess.run(
+                        [PYTHON, str(_mock_script),
+                         "--case-dir", str(_mock_case),
+                         "--out", str(_mock_out),
+                         "--limit", "50"],
+                        capture_output=True, text=True, encoding="utf-8",
+                        errors="replace", timeout=120,
+                    )
+                    if _mp.returncode == 0:
+                        _cnt, _mode = "?", "?"
+                        try:
+                            _md = json.loads(_mock_out.read_text(encoding="utf-8"))
+                            _cnt = len(_md.get("requirements", []) or [])
+                            _mode = (_md.get("meta", {}) or {}).get("analysis_mode", "?")
+                        except Exception:
+                            pass
+                        st.success(f"No-AI Flow Test OK — {_cnt} mock requirement(s) "
+                                   f"(analysis_mode={_mode}).")
+                        st.markdown(f"Output: `{_mock_out}`")
+                        st.warning(
+                            "⚠ Workflow-test mock only — NOT final RFQ extraction "
+                            "quality. No LLM was called, the formal pipeline did not "
+                            "run, and requirements.json / requirements_clean.json / "
+                            "the compliance matrix were not touched."
+                        )
+                    else:
+                        st.error(f"No-AI Flow Test failed (exit {_mp.returncode}).")
+                    if _mp.stdout:
+                        st.code(_mp.stdout, language="text")
+                except Exception as _e:
+                    st.error(f"Failed to run mock script: {_e}")
 
     # Confirmation checkbox gates Run Full Pipeline whenever prior state
     # suggests re-extraction is expensive or unnecessary.
