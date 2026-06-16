@@ -1106,7 +1106,8 @@ st.divider()
 
 # ── Upload RFQ files ──────────────────────────────────────────────────────────
 
-st.subheader("Step 1: Upload RFQ Files")
+st.subheader("Step 1: Case & Files")
+st.caption("Select or create a case, upload RFQ files, then choose which files should feed analysis.")
 rfq_dir = INBOUND_DIR / selected_case / "rfq"
 uploaded = st.file_uploader(
     "Upload DOCX / XLSX / PDF files",
@@ -1131,7 +1132,7 @@ if rfq_dir.exists():
 if mode == "Select Existing Case" and rfq_dir.exists():
     _rfq_files = sorted([f for f in rfq_dir.iterdir() if f.is_file()])
     if _rfq_files:
-        st.subheader("Step 1.5: Review & Select RFQ Files")
+        st.markdown("**File selection**")
 
         # Load doc_schema.json for role/confidence lookup; missing is OK
         _schema_path = INBOUND_DIR / selected_case / "meta" / "doc_schema.json"
@@ -1239,7 +1240,8 @@ st.divider()
 # ── Run Pipeline ──────────────────────────────────────────────────────────────
 
 if mode == "Select Existing Case":
-    st.subheader("Step 2: Run Pipeline")
+    st.subheader("Step 2: Pre-check")
+    st.caption("Confirm provider readiness, current case, existing extraction state, and runtime risk before analysis.")
 
     # Phase 4.6H — Runtime guard: prominent case display. The sidebar
     # selectbox is easy to overlook after a long browser session; this
@@ -1257,7 +1259,7 @@ if mode == "Select Existing Case":
     has_api_key = bool(os.environ.get("OPENAI_API_KEY")) or _llm_provider == "internal"
 
     use_llm_enrich = st.checkbox(
-        "Use LLM for Step 2 \u2014 Enrich (category / owner / stakeholder / redflag)",
+        "Use LLM for enrichment (category / owner / stakeholder / redflag)",
         value=True,
         disabled=not has_api_key,
         help="勾選才呼叫 LLM 判斷，不勾則用 keyword matching（速度快，不花費用）",
@@ -1346,7 +1348,7 @@ if mode == "Select Existing Case":
         st.markdown(
             f"<p style='font-size:0.95rem;color:#2E7D32;margin-bottom:4px;'>"
             f"✅ requirements.json exists ({_rcount} requirements) — "
-            f"use <b>Enrich + Format + Export</b> to continue, or Full Pipeline to re-extract</p>",
+            f"use <b>Continue Previous Run</b> to continue, or Analyze RFQ to re-extract</p>",
             unsafe_allow_html=True,
         )
     elif partial_exists:
@@ -1458,7 +1460,7 @@ if mode == "Select Existing Case":
             _shown += f", … (+{len(_excluded_files) - 3} more)"
         st.info(
             f"ℹ️ **{len(_excluded_files)} file(s) will be skipped by extraction**: {_shown}  \n"
-            "To process them, re-enable in **Step 1.5** above and click **Save Selection**."
+            "To process them, re-enable in **Step 1: Case & Files** above and click **Save Selection**."
         )
 
     # ── Pipeline lock state (computed BEFORE buttons so we can gate them) ──
@@ -1551,7 +1553,7 @@ if mode == "Select Existing Case":
     if req_json_exists:
         st.info(
             "ℹ️ `requirements.json` already exists. **Recommended:** use "
-            "**⚡ Enrich + Format + Export** unless you intentionally want "
+            "**Continue Previous Run** unless you intentionally want "
             "to re-run extraction."
         )
 
@@ -1574,7 +1576,7 @@ if mode == "Select Existing Case":
     )
 
     # ── v1.3: runtime estimate / large-run guard (on-demand; reads files, no LLM) ──
-    with st.expander("⏱ Runtime estimate / large-run guard", expanded=False):
+    with st.expander("Runtime estimate / large-run guard", expanded=True):
         st.caption("Estimates extract runtime from file size + chunking for the "
                    "current provider. No LLM call. Enrich adds ~1 call per requirement.")
         if st.button("Estimate runtime", key=f"estimate_rt_{selected_case}"):
@@ -1608,6 +1610,11 @@ if mode == "Select Existing Case":
                 elif _est.get("risk") == "warning":
                     st.warning("⚠ Estimated > 1 hour — this will take a while.")
 
+    st.subheader("Step 3: Analyze RFQ")
+    st.caption(
+        "Run AI extraction/enrichment and monitor progress. Fast UI Test / No-AI is planned for a later phase and is not wired here yet."
+    )
+
     # Confirmation checkbox gates Run Full Pipeline whenever prior state
     # suggests re-extraction is expensive or unnecessary.
     _need_confirm = req_json_exists or _est_chunks > 300
@@ -1629,29 +1636,29 @@ if mode == "Select Existing Case":
         elif st.session_state.pipeline_running:
             btn_label = "⏳  Pipeline Running…"
         elif not _confirm_full:
-            btn_label = "► Run Full Pipeline (confirm first)"
+            btn_label = "Analyze RFQ (confirm first)"
         else:
-            btn_label = "► Run Full Pipeline"
+            btn_label = "Analyze RFQ (Full Pipeline)"
         run_all = st.button(btn_label, type="primary",
                             disabled=(st.session_state.pipeline_running
                                       or _lock_active
                                       or not _confirm_full),
-                            use_container_width=True, help="Step 1 (LLM) + Step 2 + Step 3 + Step 4")
+                            use_container_width=True, help="Run the existing full pipeline: extract, enrich, format, and export")
     with col_btn2:
         if _lock_active:
             btn_label2 = "🔒  Locked by another session"
         elif st.session_state.pipeline_running:
             btn_label2 = "⏳  Pipeline Running…"
         elif req_json_exists:
-            btn_label2 = "⚡ Enrich + Format + Export  (Recommended)"
+            btn_label2 = "Continue Previous Run (Enrich + Format + Export)"
         else:
-            btn_label2 = "⚡ Enrich + Format + Export"
+            btn_label2 = "Continue Previous Run (Advanced)"
         run_partial = st.button(btn_label2,
                                 disabled=st.session_state.pipeline_running or _lock_active,
                                 use_container_width=True, help="Skip Step 1 (LLM) — use when only rules or .py files changed")
     with col_btn3:
         reset_partial = st.button(
-            "🗑️ Reset Extract (Re-extract)",
+            "Reset Extract (Advanced)",
             disabled=(not partial_exists) or st.session_state.pipeline_running or _lock_active,
             use_container_width=True,
             help="Delete partial.jsonl so the next Full Pipeline re-extracts from scratch",
@@ -1688,7 +1695,7 @@ if mode == "Select Existing Case":
         st.success(st.session_state.pop("_bg_started_msg"))
     _bg_active = _job_active(selected_case)
     if st.button(
-        "🚀 Run Full Pipeline in background (beta)",
+        "Analyze RFQ in background (beta)",
         key=f"run_bg_{selected_case}",
         disabled=(_lock_active or _bg_active),
         help="Starts scripts/pipeline_worker.py detached. Writes "
@@ -1932,9 +1939,19 @@ if mode == "Select Existing Case":
 
     st.divider()
 
-# ── Step 3: Download Results ──────────────────────────────────────────────────
+# ── Step 4 / 5 / 6: PM review, generate, and download results ─────────────────
 
-st.subheader("Step 3: Download Results")
+st.subheader("Step 4: Review / Edit Requirements")
+st.caption(
+    "Full editable review table and requirements_reviewed.json are planned for a later phase. "
+    "The current per-requirement controls remain available below."
+)
+
+st.subheader("Step 5: Generate Compliance Matrix")
+st.caption("Matrix generation still uses the existing pipeline export behavior in this phase.")
+
+st.subheader("Step 6: Download Results")
+st.caption("Compliance Matrix is the primary PM deliverable. Review sheets, raw JSON, logs, and cache details are advanced diagnostics.")
 
 if st.session_state.pipeline_done:
     st.success("Pipeline completed successfully.")
@@ -2054,10 +2071,10 @@ run_dir = RUNS_DIR / selected_case
 XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
 PRIMARY_FILES = [
-    ("requirements_review.xlsx", "Review Excel",      "PM review sheet with must-level, owner, and redflags."),
     ("compliance_matrix.xlsx",   "Compliance Matrix", "Final deliverable for distribution to customer."),
 ]
 ADVANCED_FILES = [
+    ("requirements_review.xlsx", "Review Excel"),
     ("requirements.json",          "Requirements (raw)"),
     ("requirements_enriched.json", "Requirements (enriched)"),
     ("requirements_clean.json",    "Requirements (clean)"),
@@ -2103,7 +2120,7 @@ else:
     # Advanced outputs — collapsed by default
     adv_found = any((run_dir / fn).exists() for fn, _ in ADVANCED_FILES)
     if adv_found:
-        with st.expander("Advanced Outputs", expanded=False):
+        with st.expander("Advanced / Diagnostics", expanded=False):
             for filename, label in ADVANCED_FILES:
                 fpath = run_dir / filename
                 if fpath.exists():
@@ -2115,7 +2132,7 @@ st.divider()
 # ── Step 3.5: Normalize Requirements (Phase 4.6C, optional, opt-in) ──────────
 
 if mode == "Select Existing Case":
-    st.subheader("Step 3.5: Normalize Requirements (optional)")
+    st.subheader("Advanced Tools: Normalize Requirements (optional)")
     st.markdown(
         "<p style='font-size:1.0rem;color:#455A64;margin-bottom:6px;'>"
         "Use the LLM to rewrite fragment-style requirements into complete, "
@@ -2128,7 +2145,7 @@ if mode == "Select Existing Case":
     _norm_clean_p = RUNS_DIR / selected_case / "requirements_clean.json"
     if not _norm_clean_p.exists():
         st.info(
-            "ℹ️ Run the pipeline first (Step 2) to produce "
+            "ℹ️ Run Analyze RFQ first to produce "
             "`requirements_clean.json` before normalization."
         )
     else:
@@ -2221,7 +2238,7 @@ if mode == "Select Existing Case":
                 _norm_what = "another session"
             st.info(
                 f"🔒 Cannot normalize — case is locked by {_norm_what}. "
-                "See the lock banner under Step 2 for details."
+                "See the lock banner under Step 3 for details."
             )
 
         # ── Run button ──
@@ -2449,7 +2466,11 @@ if mode == "Select Existing Case":
             )
 
 st.divider()
-st.subheader("Step 4: Review & Fill")
+st.subheader("Review / Edit Requirements (current controls)")
+st.caption(
+    "Use the current per-requirement controls for PM responses and final requirement text. "
+    "A full editable review table and requirements_reviewed.json are planned for a later phase."
+)
 
 # 初始化 ResponsesManager
 rm = ResponsesManager(RESPONSES_DIR, selected_case)
@@ -2485,7 +2506,7 @@ else:
             "This case has 0 actionable requirements. "
             "The uploaded files may be spec-reference, datasheet, or checklist documents "
             "without explicit shall/must requirements. "
-            "You can still download the empty templates from Step 3 above."
+            "You can still download the empty templates from Step 6 above."
         )
     responses = rm.load()
 
