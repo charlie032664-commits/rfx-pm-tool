@@ -1995,11 +1995,104 @@ if mode == "Select Existing Case":
 
 # ── Step 4 / 5 / 6: PM review, generate, and download results ─────────────────
 
+def _load_review_source(case_id: str):
+    """Load requirements for PM review from the highest-priority existing file.
+    Priority: reviewed -> clean -> mock -> raw. Returns (source_file, items)."""
+    rd = RUNS_DIR / case_id
+    for fname in ("requirements_reviewed.json", "requirements_clean.json",
+                  "requirements_mock.json", "requirements.json"):
+        p = rd / fname
+        if not p.exists():
+            continue
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        items = data.get("items") or data.get("requirements") or []
+        if isinstance(items, list):
+            return fname, items
+    return None, []
+
+
+def _to_review_rows(items: list) -> list:
+    """Map heterogeneous requirement items to the review table's columns."""
+    rows = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        cat = it.get("category")
+        if isinstance(cat, list):
+            cat = cat[0] if cat else ""
+        rows.append({
+            "id":          str(it.get("id") or it.get("req_id") or ""),
+            "category":    str(cat or ""),
+            "requirement": str(it.get("requirement") or it.get("text") or ""),
+            "must_level":  str(it.get("must_level") or ""),
+            "owner":       str(it.get("owner") or ""),
+            "pm_comment":  str(it.get("pm_comment") or ""),
+            "deleted":     bool(it.get("deleted", False)),
+        })
+    return rows
+
+
 st.subheader("Step 4: Review / Edit Requirements")
 st.caption(
-    "Full editable review table and requirements_reviewed.json are planned for a later phase. "
-    "The current per-requirement controls remain available below."
+    "PM review output. Edit requirements below and **Save Reviewed Requirements** to "
+    "create `requirements_reviewed.json`. This does NOT change the original AI outputs "
+    "and does NOT update `compliance_matrix.xlsx` yet — generating the matrix from "
+    "reviewed output is planned for the next phase (Step 5)."
 )
+
+# ── v1.4 Phase C-1: Review/Edit table MVP. app.py only; writes a SEPARATE
+# requirements_reviewed.json and never overwrites requirements.json / _clean.json. ──
+if mode == "Select Existing Case" and selected_case:
+    _rev_source, _rev_items = _load_review_source(selected_case)
+    if not _rev_source:
+        st.info("No requirements found yet. Run **Analyze RFQ** (or the No-AI Flow "
+                "Test) to produce requirements to review.")
+    else:
+        st.caption(
+            f"Loaded from: `{_rev_source}`"
+            + (" — your prior review" if _rev_source == "requirements_reviewed.json" else "")
+        )
+        _rev_df = pd.DataFrame(
+            _to_review_rows(_rev_items),
+            columns=["id", "category", "requirement", "must_level", "owner", "pm_comment", "deleted"],
+        )
+        _edited_rev = st.data_editor(
+            _rev_df,
+            key=f"review_editor_{selected_case}",
+            num_rows="dynamic",
+            use_container_width=True,
+        )
+        st.caption("Edit category / requirement / must_level / owner / pm_comment · "
+                   "mark **deleted** to exclude (row is kept, flagged) · add rows at the bottom.")
+        if st.button("Save Reviewed Requirements", type="primary",
+                     key=f"save_reviewed_{selected_case}"):
+            try:
+                _recs = _edited_rev.fillna("").to_dict(orient="records")
+                for _r in _recs:
+                    _r["deleted"] = bool(_r.get("deleted"))
+                _payload = {
+                    "meta": {
+                        "review_status": "pm_reviewed",
+                        "source_file": _rev_source,
+                        "saved_by": "streamlit_ui",
+                        "schema_version": "v1.4_review_mvp",
+                    },
+                    "requirements": _recs,
+                }
+                _rev_out = RUNS_DIR / selected_case / "requirements_reviewed.json"
+                _rev_out.write_text(
+                    json.dumps(_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+                _kept = sum(1 for _r in _recs if not _r["deleted"])
+                st.success(f"Saved `requirements_reviewed.json` — {len(_recs)} row(s), "
+                           f"{_kept} active (not deleted).")
+                st.warning("This is PM review output. It does NOT update "
+                           "`compliance_matrix.xlsx`. Generating the matrix from "
+                           "reviewed output is planned for the next phase.")
+            except Exception as _e:
+                st.error(f"Failed to save reviewed requirements: {_e}")
 
 st.subheader("Step 5: Generate Compliance Matrix")
 st.caption("Matrix generation still uses the existing pipeline export behavior in this phase.")
