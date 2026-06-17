@@ -2095,11 +2095,252 @@ if mode == "Select Existing Case" and selected_case:
             except Exception as _e:
                 st.error(f"Failed to save reviewed requirements: {_e}")
 
-st.subheader("Step 5: Generate Compliance Matrix")
+st.divider()
+st.subheader("Step 5: Fill Compliance Responses")
+st.caption(
+    "Optional: fill compliance status (complied / partial / not complied), response, and "
+    "remarks before generating the Excel matrix. If left blank, the matrix keeps these fields "
+    "empty. This is **compliance response filling — not requirement source editing** "
+    "(use Step 4: Review Requirements for that)."
+)
+
+# 初始化 ResponsesManager
+rm = ResponsesManager(RESPONSES_DIR, selected_case)
+
+# 讀取 requirements_clean.json（req_id 已統一為 RFQ-XXX / AI-XXX 格式）
+clean_path = RUNS_DIR / selected_case / "requirements_clean.json"
+if not clean_path.exists():
+    st.info("No requirements found. Run pipeline first.")
+else:
+    clean_data = json.loads(clean_path.read_text(encoding="utf-8"))
+
+    # ── Pipeline summary ──
+    _summary = clean_data.get("summary")
+    if _summary and isinstance(_summary, dict):
+        _s_req = _summary.get("total_requirements", 0)
+        _s_glo = _summary.get("total_glossary", 0)
+        _s_note = _summary.get("total_notes", 0)
+        with st.container(border=True):
+            _sc1, _sc2, _sc3 = st.columns(3)
+            _sc1.metric("Requirements", _s_req)
+            _sc2.metric("Glossary", _s_glo)
+            _sc3.metric("Notes / Skipped", _s_note)
+        _pm_note = _summary.get("pm_note", "")
+        if _pm_note:
+            st.warning(f"PM Note: {_pm_note}")
+
+    all_items = clean_data.get("items", [])
+    # 過濾掉 glossary / note（AUTO_SKIP）
+    items = [i for i in all_items if i.get("status") != "AUTO_SKIP"]
+
+    if not items:
+        st.info(
+            "This case has 0 actionable requirements. "
+            "The uploaded files may be spec-reference, datasheet, or checklist documents "
+            "without explicit shall/must requirements. "
+            "You can still download the empty templates from Step 6 above."
+        )
+    responses = rm.load()
+
+    # 進度統計
+    status_counts = {"COMPLIANT": 0, "PARTIAL": 0, "NON-COMPLIANT": 0,
+                     "NEW": 0, "PENDING": 0, "NEED_REVIEW": 0}
+    for item in items:
+        rid = item.get("req_id", "")
+        status_key = responses.get(rid, {}).get("status") or item.get("status", "NEW")
+        if status_key in status_counts:
+            status_counts[status_key] += 1
+        else:
+            status_counts["NEW"] += 1
+
+    s4c = st.columns(7)
+    s4c[0].metric("COMPLIANT",     status_counts["COMPLIANT"])
+    s4c[1].metric("PARTIAL",       status_counts["PARTIAL"])
+    s4c[2].metric("NON-COMPLIANT", status_counts["NON-COMPLIANT"])
+    s4c[3].metric("NEW",           status_counts["NEW"])
+    s4c[4].metric("NEED_REVIEW",   status_counts["NEED_REVIEW"])
+    s4c[5].metric("PENDING",       status_counts["PENDING"])
+    s4c[6].metric("Total",         len(items))
+
+    st.markdown("---")
+
+    # 篩選器
+    f1, f2, f3 = st.columns(3)
+    all_cats   = sorted(set(str(i.get("category", "")) for i in items))
+    all_owners = sorted(set(str(i.get("owner", "")) for i in items))
+    # Phase 4.6E.1: "Excluded" filter shows rows PM marked exclude_from_matrix=True
+    status_opts = ["All", "NEED_REVIEW", "NEW", "PENDING", "COMPLIANT", "PARTIAL", "NON-COMPLIANT", "Excluded"]
+
+    filter_status = f1.selectbox("Status",   status_opts,             key="rv_status")
+    filter_cat    = f2.selectbox("Category", ["All"] + all_cats,      key="rv_cat")
+    filter_owner  = f3.selectbox("Owner",    ["All"] + all_owners,    key="rv_owner")
+
+    # 套用篩選
+    filtered = []
+    for item in items:
+        rid = item.get("req_id", "")
+        _cur_resp = responses.get(rid, {})
+        cur_status = _cur_resp.get("status") or item.get("status", "NEW")
+        _is_pm_excluded = _cur_resp.get("exclude_from_matrix") is True
+        # Phase 4.6E.1: "Excluded" filter — only show PM-excluded rows
+        if filter_status == "Excluded":
+            if not _is_pm_excluded:
+                continue
+        elif filter_status != "All":
+            if cur_status != filter_status:
+                continue
+        if filter_cat != "All" and str(item.get("category", "")) != filter_cat:
+            continue
+        if filter_owner != "All" and str(item.get("owner", "")) != filter_owner:
+            continue
+        filtered.append(item)
+
+    st.markdown(f"**{len(filtered)} / {len(items)} requirements**")
+
+    # 每筆顯示
+    for idx, item in enumerate(filtered):
+        rid = item.get("req_id", f"UNKNOWN-{idx}")  # 原始 key，用於 responses.json
+        _key = f"{idx}_{rid}"
+        cur = responses.get(rid, {})
+        cur_status = cur.get("status") or item.get("status", "PENDING")
+        cat = item.get("category", "")
+        if isinstance(cat, list):
+            cat = ", ".join(cat)
+        _is_derived = item.get("derived", False)
+        _derived_tag = " [DERIVED]" if _is_derived else ""
+        # Phase 4.6E.1: tag rows PM marked exclude_from_matrix=True
+        _is_pm_excluded = cur.get("exclude_from_matrix") is True
+        _excluded_tag = " [EXCLUDED]" if _is_pm_excluded else ""
+        label = f"{rid} | {cat} | {cur_status}{_derived_tag}{_excluded_tag}"
+
+        with st.expander(label):
+            if _is_derived:
+                st.caption("Derived from spec table — not an explicit customer requirement. Confirm against design.")
+
+            # ── Requirement (Original) — never mutated ──
+            st.markdown(f"**Requirement (Original):** {item.get('requirement', '')}")
+
+            # ── Phase 4.6E.1: read-only Normalized display (when present) ──
+            _norm_text = (item.get("normalized_requirement") or "").strip()
+            _rewrite_reason = (item.get("rewrite_reason") or "").strip()
+            if _norm_text:
+                st.markdown(f"**Requirement (Normalized):** {_norm_text}")
+                try:
+                    _conf_str = f"{float(item.get('rewrite_confidence') or 0):.2f}"
+                except (TypeError, ValueError):
+                    _conf_str = "—"
+                _info_bits = []
+                if _rewrite_reason:
+                    _info_bits.append(f"Rewrite Reason: `{_rewrite_reason}`")
+                _info_bits.append(f"Confidence: `{_conf_str}`")
+                st.caption(" · ".join(_info_bits))
+                if bool(item.get("needs_rewrite_review", False)):
+                    st.warning(
+                        "⚠️ **REVIEW** — Normalized text may contain hallucinated "
+                        "tokens not present in the Original. Compare carefully "
+                        "before using."
+                    )
+            elif _rewrite_reason == "already_complete":
+                st.caption("✓ Already complete — Original is a standalone requirement.")
+
+            # ── Context: meta / risk / source / ai_draft (unchanged) ──
+            meta_cols = st.columns(3)
+            meta_cols[0].caption(f"Owner: {item.get('owner', '')}")
+            sh = item.get("stakeholder") or []
+            if isinstance(sh, str):
+                sh = [s.strip() for s in sh.split(",") if s.strip()]
+            meta_cols[1].caption(f"Also Involves: {', '.join(sh)}")
+            meta_cols[2].caption(f"Category: {item.get('category', '')}")
+
+            rf = item.get("risk_tags") or item.get("redflag_tags") or []
+            if isinstance(rf, str):
+                rf = [t.strip() for t in rf.split(",") if t.strip()]
+            if rf:
+                st.error(f"🚩 {', '.join(rf)}")
+            _risk_note = item.get("risk_note", "")
+            if _risk_note:
+                st.caption(f"Risk: {_risk_note}")
+
+            # Phase 4: show source so PM can trace ORPHAN_SUBITEM / NEED_REVIEW back to original
+            _src = item.get("source", "")
+            if _src:
+                st.caption(f"📍 Source: {_src}")
+
+            ai_draft = cur.get("ai_draft", "")
+            if ai_draft:
+                st.caption(f"AI Draft: {ai_draft}")
+
+            # ── Phase 4.6E.1: PM Final Requirement (editable, fallback chain) ──
+            # Default value:  PM edit (responses.final_requirement) →
+            #                 LLM normalized (item.normalized_requirement) →
+            #                 Original (item.requirement)
+            _pm_final_saved = (cur.get("final_requirement") or "").strip()
+            _orig_text = item.get("requirement", "") or ""
+            if _pm_final_saved:
+                _default_final  = _pm_final_saved
+                _default_source = "PM edit"
+            elif _norm_text:
+                _default_final  = _norm_text
+                _default_source = "normalized"
+            else:
+                _default_final  = _orig_text
+                _default_source = "original"
+            new_final = st.text_area(
+                "PM Final Requirement",
+                value=_default_final,
+                key=f"fr_{_key}",
+                help="Text that will appear in the final compliance_matrix.xlsx "
+                     "(Phase 4.6E.2 will wire this into the Excel export). "
+                     "Defaults to Normalized if available, else Original. Edit freely.",
+            )
+            st.caption(f"Default source: **{_default_source}**")
+
+            # ── Phase 4.6E.1: Exclude from final matrix ──
+            _excol1, _excol2 = st.columns([1, 3])
+            new_exclude = _excol1.checkbox(
+                "Exclude from final matrix",
+                value=bool(cur.get("exclude_from_matrix", False)),
+                key=f"ex_{_key}",
+                help="Mark to move this row to the 'Excluded' sheet of "
+                     "compliance_matrix.xlsx (Phase 4.6E.2 — Excel wiring "
+                     "is not yet active in this build).",
+            )
+            new_exclude_reason = _excol2.text_input(
+                "Exclude reason",
+                value=cur.get("exclude_reason", "") or "",
+                disabled=not new_exclude,
+                key=f"er_{_key}",
+                help="Why this row is excluded (free text). Saved to "
+                     "responses.json regardless of toggle state, so re-enabling "
+                     "Exclude restores the previous reason.",
+            )
+
+            # ── Existing edit fields ──
+            _status_options = ["PENDING", "NEED_REVIEW", "COMPLIANT", "PARTIAL", "NON-COMPLIANT"]
+            _status_idx = _status_options.index(cur_status) if cur_status in _status_options else 0
+            new_status   = st.selectbox("Status", _status_options, index=_status_idx, key=f"st_{_key}")
+            new_comment  = st.text_area("Our Response",   value=cur.get("vendor_comment", ""), key=f"vc_{_key}")
+            new_evidence = st.text_input("Evidence Link", value=cur.get("evidence", ""),        key=f"ev_{_key}")
+            new_gap      = st.text_area("Gap / Notes",    value=cur.get("gap", ""),             key=f"gp_{_key}")
+
+            if st.button("💾 Save", key=f"sv_{_key}"):
+                rm.update(rid,
+                    status=new_status,
+                    vendor_comment=new_comment,
+                    evidence=new_evidence,
+                    gap=new_gap,
+                    # Phase 4.6E.1 — three new fields:
+                    final_requirement=new_final,
+                    exclude_from_matrix=new_exclude,
+                    exclude_reason=new_exclude_reason,
+                )
+                st.success("Saved.")
+
+st.subheader("Step 6: Generate Compliance Matrix")
 st.caption("Generate compliance_matrix.xlsx from the latest requirements and compliance "
            "responses. Existing export behavior is unchanged in this milestone.")
 
-st.subheader("Step 6: Download Results")
+st.subheader("Step 7: Download Results")
 st.caption("Download the latest compliance_matrix.xlsx (the primary deliverable). Review "
            "sheets, raw JSON, logs, and cache details are under Advanced / Diagnostics.")
 
@@ -2615,243 +2856,3 @@ if mode == "Select Existing Case":
                 key=f"dl_normalize_xlsx_{selected_case}",
             )
 
-st.divider()
-st.subheader("Fill Compliance Responses")
-st.caption(
-    "Optional: fill compliance status (complied / partial / not complied), response, and "
-    "remarks before generating the Excel matrix. If left blank, the matrix keeps these fields "
-    "empty. This is **compliance response filling — not requirement source editing** "
-    "(use Step 4: Review Requirements for that)."
-)
-
-# 初始化 ResponsesManager
-rm = ResponsesManager(RESPONSES_DIR, selected_case)
-
-# 讀取 requirements_clean.json（req_id 已統一為 RFQ-XXX / AI-XXX 格式）
-clean_path = RUNS_DIR / selected_case / "requirements_clean.json"
-if not clean_path.exists():
-    st.info("No requirements found. Run pipeline first.")
-else:
-    clean_data = json.loads(clean_path.read_text(encoding="utf-8"))
-
-    # ── Pipeline summary ──
-    _summary = clean_data.get("summary")
-    if _summary and isinstance(_summary, dict):
-        _s_req = _summary.get("total_requirements", 0)
-        _s_glo = _summary.get("total_glossary", 0)
-        _s_note = _summary.get("total_notes", 0)
-        with st.container(border=True):
-            _sc1, _sc2, _sc3 = st.columns(3)
-            _sc1.metric("Requirements", _s_req)
-            _sc2.metric("Glossary", _s_glo)
-            _sc3.metric("Notes / Skipped", _s_note)
-        _pm_note = _summary.get("pm_note", "")
-        if _pm_note:
-            st.warning(f"PM Note: {_pm_note}")
-
-    all_items = clean_data.get("items", [])
-    # 過濾掉 glossary / note（AUTO_SKIP）
-    items = [i for i in all_items if i.get("status") != "AUTO_SKIP"]
-
-    if not items:
-        st.info(
-            "This case has 0 actionable requirements. "
-            "The uploaded files may be spec-reference, datasheet, or checklist documents "
-            "without explicit shall/must requirements. "
-            "You can still download the empty templates from Step 6 above."
-        )
-    responses = rm.load()
-
-    # 進度統計
-    status_counts = {"COMPLIANT": 0, "PARTIAL": 0, "NON-COMPLIANT": 0,
-                     "NEW": 0, "PENDING": 0, "NEED_REVIEW": 0}
-    for item in items:
-        rid = item.get("req_id", "")
-        status_key = responses.get(rid, {}).get("status") or item.get("status", "NEW")
-        if status_key in status_counts:
-            status_counts[status_key] += 1
-        else:
-            status_counts["NEW"] += 1
-
-    s4c = st.columns(7)
-    s4c[0].metric("COMPLIANT",     status_counts["COMPLIANT"])
-    s4c[1].metric("PARTIAL",       status_counts["PARTIAL"])
-    s4c[2].metric("NON-COMPLIANT", status_counts["NON-COMPLIANT"])
-    s4c[3].metric("NEW",           status_counts["NEW"])
-    s4c[4].metric("NEED_REVIEW",   status_counts["NEED_REVIEW"])
-    s4c[5].metric("PENDING",       status_counts["PENDING"])
-    s4c[6].metric("Total",         len(items))
-
-    st.markdown("---")
-
-    # 篩選器
-    f1, f2, f3 = st.columns(3)
-    all_cats   = sorted(set(str(i.get("category", "")) for i in items))
-    all_owners = sorted(set(str(i.get("owner", "")) for i in items))
-    # Phase 4.6E.1: "Excluded" filter shows rows PM marked exclude_from_matrix=True
-    status_opts = ["All", "NEED_REVIEW", "NEW", "PENDING", "COMPLIANT", "PARTIAL", "NON-COMPLIANT", "Excluded"]
-
-    filter_status = f1.selectbox("Status",   status_opts,             key="rv_status")
-    filter_cat    = f2.selectbox("Category", ["All"] + all_cats,      key="rv_cat")
-    filter_owner  = f3.selectbox("Owner",    ["All"] + all_owners,    key="rv_owner")
-
-    # 套用篩選
-    filtered = []
-    for item in items:
-        rid = item.get("req_id", "")
-        _cur_resp = responses.get(rid, {})
-        cur_status = _cur_resp.get("status") or item.get("status", "NEW")
-        _is_pm_excluded = _cur_resp.get("exclude_from_matrix") is True
-        # Phase 4.6E.1: "Excluded" filter — only show PM-excluded rows
-        if filter_status == "Excluded":
-            if not _is_pm_excluded:
-                continue
-        elif filter_status != "All":
-            if cur_status != filter_status:
-                continue
-        if filter_cat != "All" and str(item.get("category", "")) != filter_cat:
-            continue
-        if filter_owner != "All" and str(item.get("owner", "")) != filter_owner:
-            continue
-        filtered.append(item)
-
-    st.markdown(f"**{len(filtered)} / {len(items)} requirements**")
-
-    # 每筆顯示
-    for idx, item in enumerate(filtered):
-        rid = item.get("req_id", f"UNKNOWN-{idx}")  # 原始 key，用於 responses.json
-        _key = f"{idx}_{rid}"
-        cur = responses.get(rid, {})
-        cur_status = cur.get("status") or item.get("status", "PENDING")
-        cat = item.get("category", "")
-        if isinstance(cat, list):
-            cat = ", ".join(cat)
-        _is_derived = item.get("derived", False)
-        _derived_tag = " [DERIVED]" if _is_derived else ""
-        # Phase 4.6E.1: tag rows PM marked exclude_from_matrix=True
-        _is_pm_excluded = cur.get("exclude_from_matrix") is True
-        _excluded_tag = " [EXCLUDED]" if _is_pm_excluded else ""
-        label = f"{rid} | {cat} | {cur_status}{_derived_tag}{_excluded_tag}"
-
-        with st.expander(label):
-            if _is_derived:
-                st.caption("Derived from spec table — not an explicit customer requirement. Confirm against design.")
-
-            # ── Requirement (Original) — never mutated ──
-            st.markdown(f"**Requirement (Original):** {item.get('requirement', '')}")
-
-            # ── Phase 4.6E.1: read-only Normalized display (when present) ──
-            _norm_text = (item.get("normalized_requirement") or "").strip()
-            _rewrite_reason = (item.get("rewrite_reason") or "").strip()
-            if _norm_text:
-                st.markdown(f"**Requirement (Normalized):** {_norm_text}")
-                try:
-                    _conf_str = f"{float(item.get('rewrite_confidence') or 0):.2f}"
-                except (TypeError, ValueError):
-                    _conf_str = "—"
-                _info_bits = []
-                if _rewrite_reason:
-                    _info_bits.append(f"Rewrite Reason: `{_rewrite_reason}`")
-                _info_bits.append(f"Confidence: `{_conf_str}`")
-                st.caption(" · ".join(_info_bits))
-                if bool(item.get("needs_rewrite_review", False)):
-                    st.warning(
-                        "⚠️ **REVIEW** — Normalized text may contain hallucinated "
-                        "tokens not present in the Original. Compare carefully "
-                        "before using."
-                    )
-            elif _rewrite_reason == "already_complete":
-                st.caption("✓ Already complete — Original is a standalone requirement.")
-
-            # ── Context: meta / risk / source / ai_draft (unchanged) ──
-            meta_cols = st.columns(3)
-            meta_cols[0].caption(f"Owner: {item.get('owner', '')}")
-            sh = item.get("stakeholder") or []
-            if isinstance(sh, str):
-                sh = [s.strip() for s in sh.split(",") if s.strip()]
-            meta_cols[1].caption(f"Also Involves: {', '.join(sh)}")
-            meta_cols[2].caption(f"Category: {item.get('category', '')}")
-
-            rf = item.get("risk_tags") or item.get("redflag_tags") or []
-            if isinstance(rf, str):
-                rf = [t.strip() for t in rf.split(",") if t.strip()]
-            if rf:
-                st.error(f"🚩 {', '.join(rf)}")
-            _risk_note = item.get("risk_note", "")
-            if _risk_note:
-                st.caption(f"Risk: {_risk_note}")
-
-            # Phase 4: show source so PM can trace ORPHAN_SUBITEM / NEED_REVIEW back to original
-            _src = item.get("source", "")
-            if _src:
-                st.caption(f"📍 Source: {_src}")
-
-            ai_draft = cur.get("ai_draft", "")
-            if ai_draft:
-                st.caption(f"AI Draft: {ai_draft}")
-
-            # ── Phase 4.6E.1: PM Final Requirement (editable, fallback chain) ──
-            # Default value:  PM edit (responses.final_requirement) →
-            #                 LLM normalized (item.normalized_requirement) →
-            #                 Original (item.requirement)
-            _pm_final_saved = (cur.get("final_requirement") or "").strip()
-            _orig_text = item.get("requirement", "") or ""
-            if _pm_final_saved:
-                _default_final  = _pm_final_saved
-                _default_source = "PM edit"
-            elif _norm_text:
-                _default_final  = _norm_text
-                _default_source = "normalized"
-            else:
-                _default_final  = _orig_text
-                _default_source = "original"
-            new_final = st.text_area(
-                "PM Final Requirement",
-                value=_default_final,
-                key=f"fr_{_key}",
-                help="Text that will appear in the final compliance_matrix.xlsx "
-                     "(Phase 4.6E.2 will wire this into the Excel export). "
-                     "Defaults to Normalized if available, else Original. Edit freely.",
-            )
-            st.caption(f"Default source: **{_default_source}**")
-
-            # ── Phase 4.6E.1: Exclude from final matrix ──
-            _excol1, _excol2 = st.columns([1, 3])
-            new_exclude = _excol1.checkbox(
-                "Exclude from final matrix",
-                value=bool(cur.get("exclude_from_matrix", False)),
-                key=f"ex_{_key}",
-                help="Mark to move this row to the 'Excluded' sheet of "
-                     "compliance_matrix.xlsx (Phase 4.6E.2 — Excel wiring "
-                     "is not yet active in this build).",
-            )
-            new_exclude_reason = _excol2.text_input(
-                "Exclude reason",
-                value=cur.get("exclude_reason", "") or "",
-                disabled=not new_exclude,
-                key=f"er_{_key}",
-                help="Why this row is excluded (free text). Saved to "
-                     "responses.json regardless of toggle state, so re-enabling "
-                     "Exclude restores the previous reason.",
-            )
-
-            # ── Existing edit fields ──
-            _status_options = ["PENDING", "NEED_REVIEW", "COMPLIANT", "PARTIAL", "NON-COMPLIANT"]
-            _status_idx = _status_options.index(cur_status) if cur_status in _status_options else 0
-            new_status   = st.selectbox("Status", _status_options, index=_status_idx, key=f"st_{_key}")
-            new_comment  = st.text_area("Our Response",   value=cur.get("vendor_comment", ""), key=f"vc_{_key}")
-            new_evidence = st.text_input("Evidence Link", value=cur.get("evidence", ""),        key=f"ev_{_key}")
-            new_gap      = st.text_area("Gap / Notes",    value=cur.get("gap", ""),             key=f"gp_{_key}")
-
-            if st.button("💾 Save", key=f"sv_{_key}"):
-                rm.update(rid,
-                    status=new_status,
-                    vendor_comment=new_comment,
-                    evidence=new_evidence,
-                    gap=new_gap,
-                    # Phase 4.6E.1 — three new fields:
-                    final_requirement=new_final,
-                    exclude_from_matrix=new_exclude,
-                    exclude_reason=new_exclude_reason,
-                )
-                st.success("Saved.")
