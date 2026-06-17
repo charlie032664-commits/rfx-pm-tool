@@ -1106,8 +1106,9 @@ st.divider()
 
 # ── Upload RFQ files ──────────────────────────────────────────────────────────
 
-st.subheader("Step 1: Case & Files")
-st.caption("Select or create a case, upload RFQ files, then choose which files should feed analysis.")
+st.subheader("Step 1: Case & Source Files")
+st.caption("Select or create a case, upload RFQ files, and confirm which files should be "
+           "treated as RFQ / source inputs for analysis.")
 rfq_dir = INBOUND_DIR / selected_case / "rfq"
 uploaded = st.file_uploader(
     "Upload DOCX / XLSX / PDF files",
@@ -1241,7 +1242,8 @@ st.divider()
 
 if mode == "Select Existing Case":
     st.subheader("Step 2: Pre-check")
-    st.caption("Confirm provider readiness, current case, existing extraction state, and runtime risk before analysis.")
+    st.caption("Before analyzing: confirm the case is ready (LLM provider available), review the "
+               "estimated runtime, and check for existing results or a running / locked job.")
 
     # Phase 4.6H — Runtime guard: prominent case display. The sidebar
     # selectbox is easy to overlook after a long browser session; this
@@ -1692,27 +1694,27 @@ if mode == "Select Existing Case":
         elif not _confirm_full:
             btn_label = "Analyze RFQ (confirm first)"
         else:
-            btn_label = "Analyze RFQ (Full Pipeline)"
+            btn_label = "Analyze RFQ"
         run_all = st.button(btn_label, type="primary",
                             disabled=(st.session_state.pipeline_running
                                       or _lock_active
                                       or not _confirm_full),
-                            use_container_width=True, help="Run the existing full pipeline: extract, enrich, format, and export")
+                            use_container_width=True, help="Analyze the RFQ end-to-end: extract, enrich, format, export")
     with col_btn2:
         if _lock_active:
             btn_label2 = "🔒  Locked by another session"
         elif st.session_state.pipeline_running:
             btn_label2 = "⏳  Pipeline Running…"
         elif req_json_exists:
-            btn_label2 = "Continue Previous Run (Enrich + Format + Export)"
+            btn_label2 = "Continue from existing extraction (Advanced)"
         else:
-            btn_label2 = "Continue Previous Run (Advanced)"
+            btn_label2 = "Continue from existing extraction (Advanced)"
         run_partial = st.button(btn_label2,
                                 disabled=st.session_state.pipeline_running or _lock_active,
                                 use_container_width=True, help="Skip Step 1 (LLM) — use when only rules or .py files changed")
     with col_btn3:
         reset_partial = st.button(
-            "Reset Extract (Advanced)",
+            "Force re-extract requirements (Advanced)",
             disabled=(not partial_exists) or st.session_state.pipeline_running or _lock_active,
             use_container_width=True,
             help="Delete partial.jsonl so the next Full Pipeline re-extracts from scratch",
@@ -1749,7 +1751,7 @@ if mode == "Select Existing Case":
         st.success(st.session_state.pop("_bg_started_msg"))
     _bg_active = _job_active(selected_case)
     if st.button(
-        "Analyze RFQ in background (beta)",
+        "Run as background job (Advanced)",
         key=f"run_bg_{selected_case}",
         disabled=(_lock_active or _bg_active),
         help="Starts scripts/pipeline_worker.py detached. Writes "
@@ -1975,7 +1977,7 @@ if mode == "Select Existing Case":
     # ── v1.2: persistent job status readback (state only, no secrets) ──
     _jobst = read_job_status(RUNS_DIR / selected_case)
     if _jobst:
-        with st.expander("Pipeline job status (persistent)", expanded=False):
+        with st.expander("Job Status", expanded=False):
             st.markdown(
                 f"- **status:** `{_jobst.get('status','?')}` · "
                 f"**stage:** `{_jobst.get('stage','?')}`\n"
@@ -2035,12 +2037,11 @@ def _to_review_rows(items: list) -> list:
     return rows
 
 
-st.subheader("Step 4: Review / Edit Requirements")
+st.subheader("Step 4: Review Requirements")
 st.caption(
-    "PM review output. Edit requirements below and **Save Reviewed Requirements** to "
-    "create `requirements_reviewed.json`. This does NOT change the original AI outputs "
-    "and does NOT update `compliance_matrix.xlsx` yet — generating the matrix from "
-    "reviewed output is planned for the next phase (Step 5)."
+    "Optional: review, edit, add, or mark deleted requirements before filling compliance "
+    "responses. Click **Save Reviewed Requirements** to apply changes to the next step. "
+    "This edits requirement source only — it does not change `compliance_matrix.xlsx`."
 )
 
 # ── v1.4 Phase C-1: Review/Edit table MVP. app.py only; writes a SEPARATE
@@ -2095,10 +2096,12 @@ if mode == "Select Existing Case" and selected_case:
                 st.error(f"Failed to save reviewed requirements: {_e}")
 
 st.subheader("Step 5: Generate Compliance Matrix")
-st.caption("Matrix generation still uses the existing pipeline export behavior in this phase.")
+st.caption("Generate compliance_matrix.xlsx from the latest requirements and compliance "
+           "responses. Existing export behavior is unchanged in this milestone.")
 
 st.subheader("Step 6: Download Results")
-st.caption("Compliance Matrix is the primary PM deliverable. Review sheets, raw JSON, logs, and cache details are advanced diagnostics.")
+st.caption("Download the latest compliance_matrix.xlsx (the primary deliverable). Review "
+           "sheets, raw JSON, logs, and cache details are under Advanced / Diagnostics.")
 
 if st.session_state.pipeline_done:
     st.success("Pipeline completed successfully.")
@@ -2279,7 +2282,7 @@ st.divider()
 # ── Step 3.5: Normalize Requirements (Phase 4.6C, optional, opt-in) ──────────
 
 if mode == "Select Existing Case":
-    st.subheader("Advanced Tools: Normalize Requirements (optional)")
+    st.subheader("Advanced: Improve requirement wording with AI (optional)")
     st.markdown(
         "<p style='font-size:1.0rem;color:#455A64;margin-bottom:6px;'>"
         "Use the LLM to rewrite fragment-style requirements into complete, "
@@ -2613,10 +2616,12 @@ if mode == "Select Existing Case":
             )
 
 st.divider()
-st.subheader("Review / Edit Requirements (current controls)")
+st.subheader("Fill Compliance Responses")
 st.caption(
-    "Use the current per-requirement controls for PM responses and final requirement text. "
-    "A full editable review table and requirements_reviewed.json are planned for a later phase."
+    "Optional: fill compliance status (complied / partial / not complied), response, and "
+    "remarks before generating the Excel matrix. If left blank, the matrix keeps these fields "
+    "empty. This is **compliance response filling — not requirement source editing** "
+    "(use Step 4: Review Requirements for that)."
 )
 
 # 初始化 ResponsesManager
