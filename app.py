@@ -2337,8 +2337,48 @@ else:
                 st.success("Saved.")
 
 st.subheader("Step 6: Generate Compliance Matrix")
-st.caption("Generate compliance_matrix.xlsx from the latest requirements and compliance "
-           "responses. Existing export behavior is unchanged in this milestone.")
+st.caption("Generate or refresh compliance_matrix.xlsx using the latest cleaned requirements "
+           "and saved compliance responses. Reviewed requirement source support is planned "
+           "for the next milestone.")
+st.info("Current version uses requirements_clean.json plus saved compliance responses. "
+        "PM-reviewed requirement edits from Step 4 will be connected in the next milestone.")
+
+# ── v1.4 M5: explicit Generate Compliance Matrix action. Re-runs the existing
+# export_excel.py (cleaned requirements + saved responses) — no LLM, no
+# re-extraction, no full pipeline. Does NOT use requirements_reviewed.json yet. ──
+_gm_clean = RUNS_DIR / selected_case / "requirements_clean.json"
+_gm_li = read_lock_info(selected_case)
+_gm_lock_active = bool(_gm_li) and not is_lock_stale(_gm_li)
+_gm_running = st.session_state.get("pipeline_running", False)
+if not _gm_clean.exists():
+    st.caption("Please analyze the RFQ first before generating the matrix.")
+if st.button("Generate Compliance Matrix", type="primary",
+             key=f"gen_matrix_{selected_case}",
+             disabled=(_gm_running or _gm_lock_active or not _gm_clean.exists()),
+             help="Run export_excel.py to (re)build compliance_matrix.xlsx from "
+                  "requirements_clean.json + saved responses. No LLM, no re-extraction."):
+    if not _gm_clean.exists():
+        st.warning("Please analyze the RFQ first before generating the matrix.")
+    else:
+        try:
+            _gm_proc = subprocess.run(
+                [PYTHON, str(AI_RFX_DIR / "export_excel.py"),
+                 "--in", str(_gm_clean),
+                 "--out", str(RUNS_DIR / selected_case / "compliance_matrix.xlsx"),
+                 "--responses", str(RESPONSES_DIR / selected_case / "responses.json")],
+                capture_output=True, text=True, encoding="utf-8",
+                errors="replace", timeout=120,
+            )
+            if _gm_proc.returncode == 0:
+                st.success("Compliance Matrix generated successfully.")
+                if _gm_proc.stdout:
+                    st.code(_gm_proc.stdout, language="text")
+            else:
+                st.error(f"Matrix generation failed (exit {_gm_proc.returncode}).")
+                if _gm_proc.stderr:
+                    st.code(_gm_proc.stderr, language="text")
+        except Exception as _e:
+            st.error(f"Failed to generate matrix: {_e}")
 
 st.subheader("Step 7: Download Results")
 st.caption("Download the latest compliance_matrix.xlsx (the primary deliverable). Review "
