@@ -344,7 +344,35 @@ def _source_ref(r: Dict[str, Any]) -> str:
 
 
 def _load_reqs(data: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Accept both requirements_clean.json (items) and requirements_enriched.json (requirements)."""
+    """Accept reviewed (v1.4), clean (items), and enriched (requirements) schemas.
+
+    Priority of detection:
+      1. v1.4 PM-reviewed schema  — meta.schema_version == "v1.4_review_mvp"
+      2. requirements_clean.json  — top-level "items"
+      3. requirements_enriched.json (legacy) — top-level "requirements"
+    """
+    # ── v1.4 PM-reviewed schema (requirements_reviewed.json) ──────────────────
+    # Detect by meta.schema_version, then map the reviewed row shape onto the
+    # item shape the rest of the export flow expects (req_id / requirement /
+    # category / must_level / owner). Rows flagged deleted are skipped here, and
+    # pm_comment is intentionally NOT carried into the customer-facing matrix.
+    if data.get("meta", {}).get("schema_version") == "v1.4_review_mvp":
+        out = []
+        for req in (data.get("requirements", []) or []):
+            if req.get("deleted"):
+                continue
+            rid = req.get("id", "")
+            r = {
+                "req_id":       rid,
+                "orig_req_id":  rid,
+                "requirement":  req.get("requirement", ""),
+                "category":     req.get("category", ""),
+                "must_level":   req.get("must_level", ""),
+                "owner":        req.get("owner", ""),
+                "risk_tags":    [],
+            }
+            out.append(r)
+        return out
     if "items" in data:
         out = []
         for item in (data["items"] or []):
