@@ -22,6 +22,10 @@ from openpyxl.utils import get_column_letter
 from openpyxl.formatting.rule import FormulaRule
 
 
+# ── v1.4 Excel UX Phase 1: PM internal review column order (rename + reorder).
+#    See docs/v1.4_excel_output_ux_spec.md §3. PM-facing requirement + response
+#    columns come first; AI/normalization audit fields move to a right-hand block.
+#    This is display order/labels only — underlying values are unchanged.
 HEADERS = [
     "Req ID",
     "Priority",
@@ -29,20 +33,19 @@ HEADERS = [
     "Responsible Team",
     "Stakeholder",
     "Compliance Status",
-    # ── Phase 4.6E.2: PM final wording (fallback: PM edit → normalized → original) ──
-    "Requirement (Final)",
-    "Requirement (Original)",
-    # ── Phase 4.6 normalization output (filled by normalize_requirements_llm.py)
-    "Requirement (Normalized)",
-    "Rewrite Reason",
-    "Rewrite Confidence",
-    "Rewrite Review",
-    # ── existing columns continue ──
-    "Risk Tags",
+    # ── PM-facing requirement + response flow ──
+    "PM Reviewed Requirement",          # was "Requirement (Final)"
+    "Customer Requirement (Original)",  # was "Requirement (Original)"
     "Our Response",
     "Gap / Notes",
     "Evidence",
+    "Risk Tags",
     "Source",
+    # ── AI internal audit block (right side; filled by normalize_requirements_llm.py) ──
+    "AI Parsed Requirement",            # was "Requirement (Normalized)"
+    "AI Rewrite Status",                # was "Rewrite Reason"
+    "AI Confidence",                    # was "Rewrite Confidence"
+    "PM AI Review Status",              # was "Rewrite Review"
 ]
 
 HIDDEN_COLS: set = set()
@@ -454,9 +457,9 @@ def apply_sheet_style(ws) -> None:
     ws.freeze_panes = "A2"
 
     wrap_cols = {
-        "Requirement (Final)",
-        "Requirement (Original)",
-        "Requirement (Normalized)",
+        "PM Reviewed Requirement",
+        "Customer Requirement (Original)",
+        "AI Parsed Requirement",
         "Stakeholder",
         "Risk Tags",
         "Our Response",
@@ -481,12 +484,12 @@ def apply_sheet_style(ws) -> None:
         "Responsible Team": 14,
         "Stakeholder": 22,
         "Compliance Status": 18,
-        "Requirement (Final)": 60,
-        "Requirement (Original)": 60,
-        "Requirement (Normalized)": 60,
-        "Rewrite Reason": 24,
-        "Rewrite Confidence": 12,
-        "Rewrite Review": 10,
+        "PM Reviewed Requirement": 60,
+        "Customer Requirement (Original)": 60,
+        "AI Parsed Requirement": 60,
+        "AI Rewrite Status": 24,
+        "AI Confidence": 12,
+        "PM AI Review Status": 10,
         "Risk Tags": 22,
         "Our Response": 50,
         "Gap / Notes": 35,
@@ -506,10 +509,10 @@ def apply_sheet_style(ws) -> None:
         # ── Phase 4.6 normalization highlighting ───────────────────────────
         # Insert FIRST + stopIfTrue=True so the column-specific Normalized /
         # Review colour wins over the row-wide Status colour added below.
-        if "Requirement (Normalized)" in HEADERS and "Rewrite Review" in HEADERS:
-            nc  = HEADERS.index("Requirement (Normalized)") + 1
+        if "AI Parsed Requirement" in HEADERS and "PM AI Review Status" in HEADERS:
+            nc  = HEADERS.index("AI Parsed Requirement") + 1
             ncl = get_column_letter(nc)
-            rc  = HEADERS.index("Rewrite Review") + 1
+            rc  = HEADERS.index("PM AI Review Status") + 1
             rcl = get_column_letter(rc)
             # Normalized cell → light yellow when row is flagged REVIEW
             ws.conditional_formatting.add(
@@ -608,14 +611,19 @@ def write_sheet(ws, reqs: List[Dict[str, Any]]) -> None:
         else:
             final_req = req_text
 
+        # Order MUST match HEADERS (v1.4 Excel UX Phase 1). Same values as before;
+        # only the column positions/labels changed. AI fields moved to the right.
         ws.append([
             req_id, must_level, category, owner, stakeholder, status,
-            final_req,                                   # ← Phase 4.6E.2 col 7
-            req_text,
-            normalized, rewrite_reason, conf_str, review_str,
-            risk_str,
+            final_req,        # PM Reviewed Requirement
+            req_text,         # Customer Requirement (Original)
             our_response, gap_notes, evidence,
+            risk_str,         # Risk Tags
             source,
+            normalized,       # AI Parsed Requirement
+            rewrite_reason,   # AI Rewrite Status
+            conf_str,         # AI Confidence
+            review_str,       # PM AI Review Status
         ])
 
     apply_sheet_style(ws)
