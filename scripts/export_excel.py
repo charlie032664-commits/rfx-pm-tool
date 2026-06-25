@@ -20,6 +20,7 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
 from openpyxl.utils import get_column_letter
 from openpyxl.formatting.rule import FormulaRule
+from openpyxl.comments import Comment
 
 
 # ── v1.4 Excel UX Phase 1: PM internal review column order (rename + reorder).
@@ -49,6 +50,50 @@ HEADERS = [
 ]
 
 HIDDEN_COLS: set = set()
+
+# ── v1.4 Excel UX Phase 2A: per-column Traditional-Chinese explanations.
+#    Used both for header-cell comments on the Compliance Matrix sheet and as the
+#    "中文說明" column of the Field Guide sheet. See docs/v1.4_excel_output_ux_spec.md.
+HEADER_COMMENTS: Dict[str, str] = {
+    "Req ID":                          "需求編號，系統自動產生，用於追蹤與回覆對應。",
+    "Priority":                        "需求優先級或重要性，用於協助排序與處理。",
+    "Category":                        "需求分類，例如硬體、軟體、文件、測試或法規等。",
+    "Responsible Team":                "負責回覆或處理此需求的內部團隊。",
+    "Stakeholder":                     "相關單位或利害關係人，供內部協作追蹤。",
+    "Compliance Status":               "我方對此需求的符合狀態，例如 Compliant、Partial、Gap 或 TBD。",
+    "PM Reviewed Requirement":         "PM 確認後的正式需求文字，建議作為回覆與追蹤基準。",
+    "Customer Requirement (Original)": "客戶原始需求文字，用於追溯來源與比對。",
+    "Our Response":                    "我方針對該需求的正式回覆內容。",
+    "Gap / Notes":                     "若無法完全符合，請說明差異、限制、風險或待確認事項。",
+    "Evidence":                        "佐證資料、文件連結、測試結果或規格依據。",
+    "Risk Tags":                       "風險標籤，協助標示時程、技術、成本、法規或客戶風險。",
+    "Source":                          "需求來源，例如檔名、頁次、章節或原始資料位置。",
+    "AI Parsed Requirement":           "AI 整理後的需求文字，僅供內部 review 與追溯參考。",
+    "AI Rewrite Status":               "AI 改寫或整理原因/狀態，僅供內部 review 參考。",
+    "AI Confidence":                   "AI 對整理結果的信心分數，僅供內部判斷是否需要人工複核。",
+    "PM AI Review Status":             "PM 對 AI 整理結果的複核狀態，僅供內部流程追蹤。",
+}
+
+# Field Guide flags per column: (Editable, Internal Only)
+FIELD_GUIDE_FLAGS: Dict[str, Tuple[str, str]] = {
+    "Req ID":                          ("No",  "No"),
+    "Priority":                        ("Yes", "No"),
+    "Category":                        ("Yes", "No"),
+    "Responsible Team":                ("Yes", "Yes"),
+    "Stakeholder":                     ("Yes", "Yes"),
+    "Compliance Status":               ("Yes", "No"),
+    "PM Reviewed Requirement":         ("Yes", "No"),
+    "Customer Requirement (Original)": ("No",  "No"),
+    "Our Response":                    ("Yes", "No"),
+    "Gap / Notes":                     ("Yes", "No"),
+    "Evidence":                        ("Yes", "No"),
+    "Risk Tags":                       ("Yes", "Yes"),
+    "Source":                          ("No",  "Yes"),
+    "AI Parsed Requirement":           ("No",  "Yes"),
+    "AI Rewrite Status":               ("No",  "Yes"),
+    "AI Confidence":                   ("No",  "Yes"),
+    "PM AI Review Status":             ("Yes", "Yes"),
+}
 
 
 # ── Big category buckets ─────────────────────────────────────────────────────
@@ -561,7 +606,7 @@ def apply_sheet_style(ws) -> None:
         )
 
 
-def write_sheet(ws, reqs: List[Dict[str, Any]]) -> None:
+def write_sheet(ws, reqs: List[Dict[str, Any]], add_header_comments: bool = False) -> None:
     ws.append(HEADERS)
 
     for r in reqs:
@@ -628,6 +673,18 @@ def write_sheet(ws, reqs: List[Dict[str, Any]]) -> None:
 
     apply_sheet_style(ws)
 
+    # ── v1.4 Excel UX Phase 2A: Traditional-Chinese header comments (main sheet
+    #    only; header text is unchanged). Hover shows the field explanation. ──
+    if add_header_comments:
+        for col, h in enumerate(HEADERS, start=1):
+            note = HEADER_COMMENTS.get(h)
+            if not note:
+                continue
+            cm = Comment(note, "RFx")
+            cm.width = 260
+            cm.height = 110
+            ws.cell(row=1, column=col).comment = cm
+
     # Colour-code Req ID: RFQ- green, AI- blue
     for row in range(2, ws.max_row + 1):
         cell = ws.cell(row=row, column=1)
@@ -638,6 +695,55 @@ def write_sheet(ws, reqs: List[Dict[str, Any]]) -> None:
         elif val.startswith("AI-"):
             cell.fill = PatternFill("solid", fgColor="E6F1FB")
             cell.font = Font(name="Arial", size=10, color="0C447C")
+
+
+def write_field_guide_sheet(ws) -> None:
+    """v1.4 Excel UX Phase 2A — a reference sheet explaining each Compliance
+    Matrix column in Traditional Chinese, with Editable / Internal-Only flags.
+
+    One row per column in HEADERS order, plus a header row. Simple professional
+    style consistent with the other sheets (no over-styling).
+    """
+    headers = ["Column", "中文說明", "Editable", "Internal Only", "Notes"]
+    ws.append(headers)
+
+    for h in HEADERS:
+        editable, internal = FIELD_GUIDE_FLAGS.get(h, ("", ""))
+        desc = HEADER_COMMENTS.get(h, "")
+        if internal == "Yes":
+            note = "內部欄位，請勿提供給客戶。"
+        elif editable == "Yes":
+            note = "PM 可編輯。"
+        else:
+            note = "系統產生，建議勿手動修改。"
+        ws.append([h, desc, editable, internal, note])
+
+    # ── Styling: dark blue header, white bold; thin light-gray borders; wrap. ──
+    header_font  = Font(bold=True, color="FFFFFF", name="Arial")
+    header_fill  = PatternFill("solid", fgColor="1F4E79")
+    header_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    thin = Side(style="thin", color="D9D9D9")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    for c in range(1, ws.max_column + 1):
+        cell = ws.cell(row=1, column=c)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = header_align
+        cell.border = border
+
+    wrap = Alignment(wrap_text=True, vertical="top")
+    for row in range(2, ws.max_row + 1):
+        for col in range(1, ws.max_column + 1):
+            cell = ws.cell(row=row, column=col)
+            cell.border = border
+            cell.alignment = wrap
+
+    ws.freeze_panes = "A2"
+    widths = {1: 30, 2: 62, 3: 10, 4: 14, 5: 34}
+    for ci, w in widths.items():
+        ws.column_dimensions[get_column_letter(ci)].width = w
+    ws.auto_filter.ref = f"A1:{get_column_letter(ws.max_column)}{ws.max_row}"
 
 
 def _merge_responses(reqs: List[Dict[str, Any]], responses: Dict[str, Any]) -> None:
@@ -719,7 +825,7 @@ def export_excel(data: Dict[str, Any], out_xlsx: Path, responses_path: Optional[
     # → 6 big-category sheets numbered 3..8 → Glossary → Notes.
     # The display name is numbered ("3. Hardware") for customer-facing readability,
     # but the internal Group label inside By_Category_Summary stays "Hardware".
-    write_sheet(wb.create_sheet("Compliance Matrix"), main_reqs)
+    write_sheet(wb.create_sheet("Compliance Matrix"), main_reqs, add_header_comments=True)
 
     # Bucket the already-sorted main_reqs so each big-category sheet preserves
     # the same sort order (NEED_REVIEW > redflag > MUST > category).
@@ -734,6 +840,8 @@ def export_excel(data: Dict[str, Any], out_xlsx: Path, responses_path: Optional[
     write_sheet(wb.create_sheet("Skipped"),  skipped_reqs)
     # Phase 4.6E.2 — PM-excluded sheet (placed after Skipped)
     write_sheet(wb.create_sheet("Excluded"), pm_excluded_reqs)
+    # v1.4 Excel UX Phase 2A — Field Guide reference sheet (13th sheet, last)
+    write_field_guide_sheet(wb.create_sheet("Field Guide"))
 
     out_xlsx.parent.mkdir(parents=True, exist_ok=True)
     wb.save(out_xlsx)
@@ -790,7 +898,7 @@ def main():
     print("[OK] Sheets: Compliance Matrix, By_Category_Summary, "
           "3. Hardware, 4. Software, 5. Mechanical, "
           "6. Regulatory, 7. Environmental, 8. Others, "
-          "Glossary, Notes, Skipped, Excluded")
+          "Glossary, Notes, Skipped, Excluded, Field Guide")
 
 
 if __name__ == "__main__":
