@@ -499,7 +499,8 @@ def apply_sheet_style(ws) -> None:
         cell.alignment = header_align
         cell.border = border
 
-    ws.freeze_panes = "A2"
+    # ── v1.4 Excel UX Phase 2B: freeze header row + Req ID column ──
+    ws.freeze_panes = "B2"
 
     wrap_cols = {
         "PM Reviewed Requirement",
@@ -512,12 +513,28 @@ def apply_sheet_style(ws) -> None:
         "Evidence",
     }
 
+    # ── v1.4 Excel UX Phase 2B: subtle column-group fills ──
+    # AI/internal audit block (N-Q) → light blue-gray, reads as a reference block.
+    # PM editable response fields (I-K) → very subtle warm fill (not a warning look).
+    # Status/normalization conditional formatting still wins where it applies.
+    ai_block_cols    = {"AI Parsed Requirement", "AI Rewrite Status",
+                        "AI Confidence", "PM AI Review Status"}
+    pm_response_cols = {"Our Response", "Gap / Notes", "Evidence"}
+    ai_fill   = PatternFill("solid", fgColor="EAF2F8")
+    pm_fill   = PatternFill("solid", fgColor="FFF9E6")
+    ai_font   = Font(name="Arial", size=10, color="1F2937")  # dark gray
+
     for row in range(2, ws.max_row + 1):
         for col in range(1, ws.max_column + 1):
             cell = ws.cell(row=row, column=col)
             cell.border = border
             h = ws.cell(row=1, column=col).value
             cell.alignment = wrap if h in wrap_cols else top
+            if h in ai_block_cols:
+                cell.fill = ai_fill
+                cell.font = ai_font
+            elif h in pm_response_cols:
+                cell.fill = pm_fill
 
     ws.auto_filter.ref = f"A1:{get_column_letter(ws.max_column)}{ws.max_row}"
 
@@ -531,14 +548,14 @@ def apply_sheet_style(ws) -> None:
         "Compliance Status": 18,
         "PM Reviewed Requirement": 60,
         "Customer Requirement (Original)": 60,
-        "AI Parsed Requirement": 60,
+        "AI Parsed Requirement": 58,
         "AI Rewrite Status": 24,
-        "AI Confidence": 12,
-        "PM AI Review Status": 10,
+        "AI Confidence": 14,
+        "PM AI Review Status": 16,
         "Risk Tags": 22,
         "Our Response": 50,
         "Gap / Notes": 35,
-        "Evidence": 35,
+        "Evidence": 30,
         "Source": 40,
     })
     for idx, h in enumerate(HEADERS, start=1):
@@ -685,16 +702,18 @@ def write_sheet(ws, reqs: List[Dict[str, Any]], add_header_comments: bool = Fals
             cm.height = 110
             ws.cell(row=1, column=col).comment = cm
 
-    # Colour-code Req ID: RFQ- green, AI- blue
+    # ── v1.4 Excel UX Phase 2B: professional Req ID styling (no bright green) ──
+    #    RFQ / normal → dark gray text on a very subtle light-gray fill.
+    #    AI           → dark blue text on a subtle light blue-gray fill.
     for row in range(2, ws.max_row + 1):
         cell = ws.cell(row=row, column=1)
         val = str(cell.value or "")
-        if val.startswith("RFQ-"):
-            cell.fill = PatternFill("solid", fgColor="EAF3DE")
-            cell.font = Font(name="Arial", size=10, color="27500A")
-        elif val.startswith("AI-"):
-            cell.fill = PatternFill("solid", fgColor="E6F1FB")
-            cell.font = Font(name="Arial", size=10, color="0C447C")
+        if val.startswith("AI-"):
+            cell.fill = PatternFill("solid", fgColor="EAF2F8")
+            cell.font = Font(name="Arial", size=10, color="1D4ED8")
+        else:
+            cell.fill = PatternFill("solid", fgColor="F3F4F6")
+            cell.font = Font(name="Arial", size=10, color="1F2937")
 
 
 def write_field_guide_sheet(ws) -> None:
